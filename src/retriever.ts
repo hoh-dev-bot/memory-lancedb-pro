@@ -6,6 +6,7 @@
 import type { MemoryStore, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
+import { expandQuery } from "./query-expander.js";
 import {
   AccessTracker,
   parseAccessMetadata,
@@ -389,7 +390,7 @@ export class MemoryRetriever {
         scopeFilter,
         category,
       ),
-      this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
+      this.runBM25Search(expandQuery(query), candidatePoolSize, scopeFilter, category),
     ]);
 
     // Fuse results using RRF (async: validates BM25-only entries exist in store)
