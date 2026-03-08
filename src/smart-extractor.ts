@@ -52,6 +52,8 @@ export interface SmartExtractorConfig {
   defaultScope?: string;
   /** Logger function. */
   log?: (msg: string) => void;
+  /** Debug logger function. */
+  debugLog?: (msg: string) => void;
 }
 
 export interface ExtractPersistOptions {
@@ -63,6 +65,7 @@ export interface ExtractPersistOptions {
 
 export class SmartExtractor {
   private log: (msg: string) => void;
+  private debugLog: (msg: string) => void;
 
   constructor(
     private store: MemoryStore,
@@ -71,6 +74,7 @@ export class SmartExtractor {
     private config: SmartExtractorConfig = {},
   ) {
     this.log = config.log ?? ((msg: string) => console.log(msg));
+    this.debugLog = config.debugLog ?? (() => {});
   }
 
   // --------------------------------------------------------------------------
@@ -151,28 +155,66 @@ export class SmartExtractor {
         overview: string;
         content: string;
       }>;
-    }>(prompt);
+    }>(prompt, "extract-candidates");
 
-    if (!result?.memories || !Array.isArray(result.memories)) {
+    if (!result) {
+      this.debugLog(
+        "memory-lancedb-pro: smart-extractor: extract-candidates returned null",
+      );
+      return [];
+    }
+    if (!result.memories || !Array.isArray(result.memories)) {
+      this.debugLog(
+        `memory-lancedb-pro: smart-extractor: extract-candidates returned unexpected shape keys=${Object.keys(result).join(",") || "(none)"}`,
+      );
       return [];
     }
 
+    this.debugLog(
+      `memory-lancedb-pro: smart-extractor: extract-candidates raw memories=${result.memories.length}`,
+    );
+
     // Validate and normalize candidates
     const candidates: CandidateMemory[] = [];
+    let invalidCategoryCount = 0;
+    let shortAbstractCount = 0;
+    let noiseAbstractCount = 0;
     for (const raw of result.memories) {
       const category = normalizeCategory(raw.category ?? "");
-      if (!category) continue;
+      if (!category) {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping candidate due to invalid category rawCategory=${JSON.stringify(raw.category ?? "")} abstract=${JSON.stringify((raw.abstract ?? "").trim().slice(0, 120))}`,
+        );
+        continue;
+      }
 
       const abstract = (raw.abstract ?? "").trim();
       const overview = (raw.overview ?? "").trim();
       const content = (raw.content ?? "").trim();
 
       // Skip empty or noise
-      if (!abstract || abstract.length < 5) continue;
-      if (isNoise(abstract)) continue;
+      if (!abstract || abstract.length < 5) {
+        shortAbstractCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping candidate due to short abstract category=${category} abstract=${JSON.stringify(abstract)}`,
+        );
+        continue;
+      }
+      if (isNoise(abstract)) {
+        noiseAbstractCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping candidate due to noise abstract category=${category} abstract=${JSON.stringify(abstract.slice(0, 120))}`,
+        );
+        continue;
+      }
 
       candidates.push({ category, abstract, overview, content });
     }
+
+    this.debugLog(
+      `memory-lancedb-pro: smart-extractor: validation summary accepted=${candidates.length}, invalidCategory=${invalidCategoryCount}, shortAbstract=${shortAbstractCount}, noiseAbstract=${noiseAbstractCount}`,
+    );
 
     return candidates;
   }
@@ -308,7 +350,7 @@ export class SmartExtractor {
         decision: string;
         reason: string;
         match_index?: number;
-      }>(prompt);
+      }>(prompt, "dedup-decision");
 
       if (!data) {
         this.log(
@@ -445,7 +487,7 @@ export class SmartExtractor {
       abstract: string;
       overview: string;
       content: string;
-    }>(prompt);
+    }>(prompt, "merge-memory");
 
     if (!merged) {
       this.log("memory-pro: smart-extractor: merge LLM failed, skipping merge");

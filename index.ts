@@ -643,6 +643,128 @@ function shouldSkipReflectionMessage(role: string, text: string): boolean {
   return false;
 }
 
+const AUTO_CAPTURE_INBOUND_META_SENTINELS = [
+  "Conversation info (untrusted metadata):",
+  "Sender (untrusted metadata):",
+  "Thread starter (untrusted, for context):",
+  "Replied message (untrusted, for context):",
+  "Forwarded message context (untrusted metadata):",
+  "Chat history since last reply (untrusted, for context):",
+] as const;
+
+const AUTO_CAPTURE_SESSION_RESET_PREFIX =
+  "A new session was started via /new or /reset. Execute your Session Startup sequence now";
+const AUTO_CAPTURE_ADDRESSING_PREFIX_RE = /^(?:<@!?[0-9]+>|@[A-Za-z0-9_.-]+)\s*/;
+const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
+  /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
+
+function isAutoCaptureInboundMetaSentinelLine(line: string): boolean {
+  const trimmed = line.trim();
+  return AUTO_CAPTURE_INBOUND_META_SENTINELS.some((sentinel) => sentinel === trimmed);
+}
+
+function stripLeadingInboundMetadata(text: string): string {
+  if (!text || !AUTO_CAPTURE_INBOUND_META_SENTINELS.some((sentinel) => text.includes(sentinel))) {
+    return text;
+  }
+
+  const lines = text.split("\n");
+  let index = 0;
+  while (index < lines.length && lines[index].trim() === "") {
+    index++;
+  }
+
+  while (index < lines.length && isAutoCaptureInboundMetaSentinelLine(lines[index])) {
+    index++;
+    if (index < lines.length && lines[index].trim() === "```json") {
+      index++;
+      while (index < lines.length && lines[index].trim() !== "```") {
+        index++;
+      }
+      if (index < lines.length && lines[index].trim() === "```") {
+        index++;
+      }
+    } else {
+      return text;
+    }
+
+    while (index < lines.length && lines[index].trim() === "") {
+      index++;
+    }
+  }
+
+  return lines.slice(index).join("\n").trim();
+}
+
+function stripAutoCaptureSessionResetPrefix(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith(AUTO_CAPTURE_SESSION_RESET_PREFIX)) {
+    return trimmed;
+  }
+
+  const blankLineIndex = trimmed.indexOf("\n\n");
+  if (blankLineIndex >= 0) {
+    return trimmed.slice(blankLineIndex + 2).trim();
+  }
+
+  const lines = trimmed.split("\n");
+  if (lines.length <= 2) {
+    return "";
+  }
+  return lines.slice(2).join("\n").trim();
+}
+
+function stripAutoCaptureAddressingPrefix(text: string): string {
+  return text.replace(AUTO_CAPTURE_ADDRESSING_PREFIX_RE, "").trim();
+}
+
+function isExplicitRememberCommand(text: string): boolean {
+  return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
+}
+
+function buildAutoCaptureConversationKeyFromIngress(
+  channelId: string | undefined,
+  conversationId: string | undefined,
+): string | null {
+  const channel = typeof channelId === "string" ? channelId.trim() : "";
+  const conversation = typeof conversationId === "string" ? conversationId.trim() : "";
+  if (!channel || !conversation) return null;
+  return `${channel}:${conversation}`;
+}
+
+function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): string | null {
+  const trimmed = sessionKey.trim();
+  if (!trimmed) return null;
+  const match = /^agent:[^:]+:(.+)$/.exec(trimmed);
+  const suffix = match?.[1]?.trim();
+  return suffix || null;
+}
+
+function stripAutoCaptureInjectedPrefix(role: string, text: string): string {
+  if (role !== "user") {
+    return text.trim();
+  }
+
+  let normalized = text.trim();
+  normalized = normalized.replace(/^<relevant-memories>\s*[\s\S]*?<\/relevant-memories>\s*/i, "");
+  normalized = normalized.replace(
+    /^\[UNTRUSTED DATA[^\n]*\][\s\S]*?\[END UNTRUSTED DATA\]\s*/i,
+    "",
+  );
+  normalized = stripAutoCaptureSessionResetPrefix(normalized);
+  normalized = stripLeadingInboundMetadata(normalized);
+  normalized = stripAutoCaptureAddressingPrefix(normalized);
+  return normalized.trim();
+}
+
+function normalizeAutoCaptureText(role: unknown, text: string): string | null {
+  if (typeof role !== "string") return null;
+  const normalized = stripAutoCaptureInjectedPrefix(role, text);
+  if (!normalized) return null;
+  if (shouldSkipReflectionMessage(role, normalized)) return null;
+  return normalized;
+}
+
 function redactSecrets(text: string): string {
   const patterns: RegExp[] = [
     /Bearer\s+[A-Za-z0-9\-._~+/]+=*/g,
@@ -1197,6 +1319,39 @@ function sanitizeForContext(text: string): string {
     .slice(0, 300);
 }
 
+function summarizeTextPreview(text: string, maxLen = 120): string {
+  return JSON.stringify(sanitizeForContext(text).slice(0, maxLen));
+}
+
+function summarizeMessageContent(content: unknown): string {
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return `string(len=${trimmed.length}, preview=${summarizeTextPreview(trimmed)})`;
+  }
+  if (Array.isArray(content)) {
+    const textBlocks: string[] = [];
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as Record<string, unknown>).type === "text" &&
+        typeof (block as Record<string, unknown>).text === "string"
+      ) {
+        textBlocks.push((block as Record<string, unknown>).text as string);
+      }
+    }
+    const combined = textBlocks.join(" ").trim();
+    return `array(blocks=${content.length}, textBlocks=${textBlocks.length}, textLen=${combined.length}, preview=${summarizeTextPreview(combined)})`;
+  }
+  return `type=${Array.isArray(content) ? "array" : typeof content}`;
+}
+
+function summarizeCaptureDecision(text: string): string {
+  const trimmed = text.trim();
+  const preview = sanitizeForContext(trimmed).slice(0, 120);
+  return `len=${trimmed.length}, trigger=${shouldCapture(trimmed) ? "Y" : "N"}, noise=${isNoise(trimmed) ? "Y" : "N"}, preview=${JSON.stringify(preview)}`;
+}
+
 // ============================================================================
 // Session Path Helpers
 // ============================================================================
@@ -1463,6 +1618,7 @@ const memoryLanceDBProPlugin = {
           model: llmModel,
           baseURL: llmBaseURL,
           timeoutMs: 30000,
+          log: (msg: string) => api.logger.debug(msg),
         });
 
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
@@ -1471,6 +1627,7 @@ const memoryLanceDBProPlugin = {
           extractMaxChars: config.extractMaxChars ?? 8000,
           defaultScope: config.scopes?.default ?? "global",
           log: (msg: string) => api.logger.info(msg),
+          debugLog: (msg: string) => api.logger.debug(msg),
         });
 
         api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ")");
@@ -1671,10 +1828,45 @@ const memoryLanceDBProPlugin = {
     // Map<sessionId, turnCounter> - manual turn tracking per session
     const turnCounter = new Map<string, number>();
 
+    // Track how many normalized user texts have already been seen per session snapshot.
+    const autoCaptureSeenTextCount = new Map<string, number>();
+    const autoCapturePendingIngressTexts = new Map<string, string[]>();
+    const autoCaptureRecentTexts = new Map<string, string[]>();
+
     api.logger.info(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
     );
     api.logger.info(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
+
+    api.on("message_received", (event, ctx) => {
+      const conversationKey = buildAutoCaptureConversationKeyFromIngress(
+        ctx.channelId,
+        ctx.conversationId,
+      );
+      const normalized = normalizeAutoCaptureText("user", event.content);
+      if (conversationKey && normalized) {
+        const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
+        queue.push(normalized);
+        autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress message_received channel=${ctx.channelId} account=${ctx.accountId || "unknown"} conversation=${ctx.conversationId || "unknown"} from=${event.from} len=${event.content.trim().length} preview=${summarizeTextPreview(event.content)}`,
+      );
+    });
+
+    api.on("before_message_write", (event, ctx) => {
+      const message = event.message as Record<string, unknown> | undefined;
+      const role =
+        message && typeof message.role === "string" && message.role.trim().length > 0
+          ? message.role
+          : "unknown";
+      if (role !== "user") {
+        return;
+      }
+      api.logger.debug(
+        `memory-lancedb-pro: ingress before_message_write agent=${ctx.agentId || event.agentId || "unknown"} sessionKey=${ctx.sessionKey || event.sessionKey || "unknown"} role=${role} ${summarizeMessageContent(message?.content)}`,
+      );
+    });
 
     // ========================================================================
     // Markdown Mirror
@@ -1851,14 +2043,15 @@ const memoryLanceDBProPlugin = {
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
           const defaultScope = scopeManager.getDefaultScope(agentId);
-          const sessionKey = (event as any).sessionKey || "unknown";
+          const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
           api.logger.debug(
             `memory-lancedb-pro: auto-capture agent_end payload for agent ${agentId} (sessionKey=${sessionKey}, captureAssistant=${config.captureAssistant === true}, ${summarizeAgentEndMessages(event.messages)})`,
           );
 
           // Extract text content from messages
-          const texts: string[] = [];
+          const eligibleTexts: string[] = [];
+          let skippedAutoCaptureTexts = 0;
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") {
               continue;
@@ -1877,7 +2070,12 @@ const memoryLanceDBProPlugin = {
             const content = msgObj.content;
 
             if (typeof content === "string") {
-              texts.push(content);
+              const normalized = normalizeAutoCaptureText(role, content);
+              if (!normalized) {
+                skippedAutoCaptureTexts++;
+              } else {
+                eligibleTexts.push(normalized);
+              }
               continue;
             }
 
@@ -1891,16 +2089,79 @@ const memoryLanceDBProPlugin = {
                   "text" in block &&
                   typeof (block as Record<string, unknown>).text === "string"
                 ) {
-                  texts.push((block as Record<string, unknown>).text as string);
+                  const text = (block as Record<string, unknown>).text as string;
+                  const normalized = normalizeAutoCaptureText(role, text);
+                  if (!normalized) {
+                    skippedAutoCaptureTexts++;
+                  } else {
+                    eligibleTexts.push(normalized);
+                  }
                 }
               }
             }
           }
 
+          const conversationKey = buildAutoCaptureConversationKeyFromSessionKey(sessionKey);
+          const pendingIngressTexts = conversationKey
+            ? [...(autoCapturePendingIngressTexts.get(conversationKey) || [])]
+            : [];
+          if (conversationKey) {
+            autoCapturePendingIngressTexts.delete(conversationKey);
+          }
+
+          const previousSeenCount = autoCaptureSeenTextCount.get(sessionKey) ?? 0;
+          let newTexts = eligibleTexts;
+          if (pendingIngressTexts.length > 0) {
+            newTexts = pendingIngressTexts;
+          } else if (previousSeenCount > 0 && eligibleTexts.length > previousSeenCount) {
+            newTexts = eligibleTexts.slice(previousSeenCount);
+          }
+          autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+
+          const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
+          let texts = newTexts;
+          if (
+            texts.length === 1 &&
+            isExplicitRememberCommand(texts[0]) &&
+            priorRecentTexts.length > 0
+          ) {
+            texts = [...priorRecentTexts.slice(-1), ...texts];
+          }
+          if (newTexts.length > 0) {
+            const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
+            autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
+          }
+
           const minMessages = config.extractMinMessages ?? 2;
+          if (skippedAutoCaptureTexts > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
+            );
+          }
+          if (pendingIngressTexts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture using ${pendingIngressTexts.length} pending ingress text(s) for agent ${agentId}`,
+            );
+          }
+          if (texts.length !== eligibleTexts.length) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture narrowed ${eligibleTexts.length} eligible history text(s) to ${texts.length} new text(s) for agent ${agentId}`,
+            );
+          }
           api.logger.debug(
             `memory-lancedb-pro: auto-capture collected ${texts.length} text(s) for agent ${agentId} (minMessages=${minMessages}, smartExtraction=${smartExtractor ? "on" : "off"})`,
           );
+          if (texts.length === 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture found no eligible texts after filtering for agent ${agentId}`,
+            );
+            return;
+          }
+          if (texts.length > 0) {
+            api.logger.debug(
+              `memory-lancedb-pro: auto-capture text diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+            );
+          }
 
           // ----------------------------------------------------------------
           // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
@@ -1923,7 +2184,7 @@ const memoryLanceDBProPlugin = {
               }
 
               api.logger.info(
-                `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId}; falling back to regex capture`,
+                `memory-lancedb-pro: smart extraction produced no persisted memories for agent ${agentId} (created=${stats.created}, merged=${stats.merged}, skipped=${stats.skipped}); falling back to regex capture`,
               );
             } else {
               api.logger.debug(
@@ -1941,6 +2202,11 @@ const memoryLanceDBProPlugin = {
           // ----------------------------------------------------------------
           const toCapture = texts.filter((text) => text && shouldCapture(text) && !isNoise(text));
           if (toCapture.length === 0) {
+            if (texts.length > 0) {
+              api.logger.debug(
+                `memory-lancedb-pro: regex fallback diagnostics for agent ${agentId}: ${texts.map((text, idx) => `#${idx + 1}(${summarizeCaptureDecision(text)})`).join(" | ")}`,
+              );
+            }
             api.logger.info(
               `memory-lancedb-pro: regex fallback found 0 capturable texts for agent ${agentId}`,
             );

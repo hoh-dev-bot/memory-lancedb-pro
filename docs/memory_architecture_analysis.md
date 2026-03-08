@@ -190,12 +190,28 @@ graph TD
 
 其中自动捕获是最核心的在线写入链路。
 
-### 4.2 `agent_end` 写入主路径
+### 4.2 自动捕获写入主路径
 
-`agent_end` 的执行顺序是：
+当前自动捕获的真实入口已经不是“裸 `agent_end.messages` 直读”，而是一个轻量的运行时适配层：
 
 ```text
-抽取文本（默认仅 `user`；当 `captureAssistant === true` 时也包含 `assistant`）
+message_received
+  -> 归一化实时入站文本（去 addressing / 去 OpenClaw 注入前缀）
+  -> 按 conversationKey 暂存最近少量原始用户文本
+
+agent_end
+  -> 从 event.messages 提取 user/assistant 文本
+  -> 再做同一套归一化（去 recall block / inbound metadata / session reset prompt / addressing）
+  -> 优先消费 pending ingress texts
+  -> 若无 pending ingress，则退回到 session snapshot 的“新增文本增量”
+  -> 若只有显式 remember 指令，则可补上一条最近真实文本形成最小上下文
+  -> 进入 smart extraction / regex fallback 主链
+```
+
+进入写入主链后的执行顺序是：
+
+```text
+抽取并归一化文本（默认仅 `user`；当 `captureAssistant === true` 时也包含 `assistant`）
   -> 若 smartExtractor 可用且消息数达阈值:
        SmartExtractor.extractAndPersist()
        若 created > 0 或 merged > 0，则直接 return
@@ -207,11 +223,16 @@ graph TD
 
 几个关键点：
 
+- 当前实现增加了一层“OpenClaw runtime 适配层”，用来消解 `prependContext`、inbound metadata、addressing、session snapshot 粒度等上游差异
 - 智能提取只有在产出持久化结果时，才会接管整个自动捕获路径
 - regex fallback 仍存在，但已经不再输出“半旧格式数据”
 - fallback 写入前仍做噪声过滤与重复检查
 - 每轮对话最多写入 3 条 fallback memory
-- 在 OpenClaw 实际运行中，`agent_end.event.messages` 的粒度取决于上游 Hook payload；当前插件不会主动回读会话历史，而是直接消费该事件携带的消息数组
+- 当前插件不会主动回读 session JSONL 或 LanceDB 历史来拼装捕获输入；运行时上下文只来自：
+  - `message_received` 的短暂内存队列
+  - `agent_end.event.messages`
+  - 当前进程内的极小 recent-text 缓存
+- 这层适配是 OpenClaw runtime 通用策略，不绑定 Discord/Telegram 等具体渠道协议字段
 
 ### 4.3 SmartExtractor 主链
 
