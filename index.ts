@@ -59,7 +59,7 @@ import { selectFinalAutoRecallResults } from "./src/auto-recall-final-selection.
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey?: string;
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -2712,11 +2712,18 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     // apiKey is present but wrong type — throw, don't silently fall back
     throw new Error("embedding.apiKey must be a string or non-empty array of strings");
   } else {
-    apiKey = process.env.OPENAI_API_KEY || "";
-  }
-
-  if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
-    throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
+    // No apiKey configured — try env var, then fall back to dummy key for local providers (e.g. Ollama)
+    const envKey = process.env.OPENAI_API_KEY;
+    if (envKey) {
+      apiKey = envKey;
+    } else {
+      apiKey = "no-key-required";
+      console.warn(
+        "[memory-lancedb-pro] No embedding.apiKey configured and OPENAI_API_KEY env var not set. " +
+        "This is fine for local providers (Ollama), but cloud providers (Jina, OpenAI) will fail at runtime. " +
+        "Set embedding.apiKey in plugin config or export OPENAI_API_KEY to fix.",
+      );
+    }
   }
 
   const memoryReflectionRaw = typeof cfg.memoryReflection === "object" && cfg.memoryReflection !== null
