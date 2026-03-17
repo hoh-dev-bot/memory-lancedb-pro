@@ -510,8 +510,24 @@ export class MemoryRetriever {
         }) as RetrievalResult,
     );
 
-    const processed = this.applyPostProcessingPipeline(mapped);
-    return processed.slice(0, limit);
+    // Apply same post-processing as hybrid retrieval to avoid behavior regression
+    const temporallyRanked = this.decayEngine
+      ? mapped
+      : this.applyImportanceWeight(this.applyRecencyBoost(mapped));
+
+    const lengthNormalized = this.applyLengthNormalization(temporallyRanked);
+    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
+
+    const lifecycleRanked = this.decayEngine
+      ? this.applyDecayBoost(hardFiltered)
+      : this.applyTimeDecay(hardFiltered);
+
+    const denoised = this.config.filterNoise
+      ? filterNoise(lifecycleRanked, r => r.entry.text)
+      : lifecycleRanked;
+
+    const deduplicated = this.applyMMRDiversity(denoised);
+    return deduplicated.slice(0, limit);
   }
 
   private async hybridRetrieval(
@@ -860,19 +876,6 @@ export class MemoryRetriever {
    * when semantic similarity is close.
    * Formula: boost = exp(-ageDays / halfLife) * weight
    */
-  private applyPostProcessingPipeline(results: RetrievalResult[]): RetrievalResult[] {
-    const recencyBoosted = this.applyRecencyBoost(results);
-    const importanceWeighted = this.applyImportanceWeight(recencyBoosted);
-    const lengthNormalized = this.applyLengthNormalization(importanceWeighted);
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    const hardFiltered = timeDecayed.filter((r) => r.score >= this.config.hardMinScore);
-    const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, (r) => r.entry.text)
-      : hardFiltered;
-    const deduplicated = this.applyMMRDiversity(denoised);
-    return deduplicated;
-  }
-
   private applyRecencyBoost(results: RetrievalResult[]): RetrievalResult[] {
     const { recencyHalfLifeDays, recencyWeight } = this.config;
     if (!recencyHalfLifeDays || recencyHalfLifeDays <= 0 || !recencyWeight) {
