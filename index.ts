@@ -3828,9 +3828,9 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       }
       : {
         enabled: true,
-        beforeResetNote: false,
-        skipSubagentBootstrap: false,
-        ensureLearningFiles: false,
+        beforeResetNote: true,
+        skipSubagentBootstrap: true,
+        ensureLearningFiles: true,
       },
     memoryReflection: memoryReflectionRaw
       ? {
