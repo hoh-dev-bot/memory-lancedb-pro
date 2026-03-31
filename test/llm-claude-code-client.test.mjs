@@ -9,33 +9,47 @@ import jitiFactory from "jiti";
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
 const { createLlmClient, buildClaudeCodeEnv, extractJsonFromResponse, repairCommonJson } = jiti("../src/llm-client.ts");
 
+/**
+ * Save, override, and restore env vars around a callback.
+ * Accepts a record of key -> value (string to set, undefined to delete).
+ */
+function withEnv(overrides, fn) {
+  const saved = {};
+  for (const key of Object.keys(overrides)) {
+    saved[key] = process.env[key];
+    if (overrides[key] === undefined) delete process.env[key];
+    else process.env[key] = overrides[key];
+  }
+  try {
+    return fn();
+  } finally {
+    for (const key of Object.keys(saved)) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // buildClaudeCodeEnv — env sanitization (most critical security logic)
 // ---------------------------------------------------------------------------
 
+/** Common env overrides that clear all auth sources. */
+const NO_AUTH_ENV = { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined, CLAUDE_CODE_OAUTH_TOKEN: undefined };
+
 describe("buildClaudeCodeEnv", () => {
   it("preserves ANTHROPIC_API_KEY when no explicit key provided (ambient auth)", () => {
-    const saved = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = "ambient-key";
-    try {
+    withEnv({ ANTHROPIC_API_KEY: "ambient-key" }, () => {
       const env = buildClaudeCodeEnv(undefined);
       assert.equal(env.ANTHROPIC_API_KEY, "ambient-key", "should preserve ambient key when no explicit key");
-    } finally {
-      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = saved;
-    }
+    });
   });
 
   it("replaces ANTHROPIC_API_KEY when explicit key provided", () => {
-    const saved = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = "ambient-key";
-    try {
+    withEnv({ ANTHROPIC_API_KEY: "ambient-key" }, () => {
       const env = buildClaudeCodeEnv("explicit-key");
       assert.equal(env.ANTHROPIC_API_KEY, "explicit-key", "explicit key should override ambient");
-    } finally {
-      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
-      else process.env.ANTHROPIC_API_KEY = saved;
-    }
+    });
   });
 
   it("always sets CLAUDE_CODE_ENTRYPOINT=sdk-ts", () => {
@@ -44,115 +58,68 @@ describe("buildClaudeCodeEnv", () => {
   });
 
   it("strips CLAUDECODE (exact) to prevent nested-session errors", () => {
-    const saved = process.env.CLAUDECODE;
-    process.env.CLAUDECODE = "1";
-    try {
+    withEnv({ CLAUDECODE: "1" }, () => {
       const env = buildClaudeCodeEnv();
       assert.equal(env.CLAUDECODE, undefined, "CLAUDECODE should be stripped");
-    } finally {
-      if (saved === undefined) delete process.env.CLAUDECODE;
-      else process.env.CLAUDECODE = saved;
-    }
+    });
   });
 
   it("strips CLAUDECODE_* prefixed vars", () => {
-    process.env.CLAUDECODE_SOME_VAR = "should-be-stripped";
-    try {
+    withEnv({ CLAUDECODE_SOME_VAR: "should-be-stripped" }, () => {
       const env = buildClaudeCodeEnv();
       assert.equal(env.CLAUDECODE_SOME_VAR, undefined);
-    } finally {
-      delete process.env.CLAUDECODE_SOME_VAR;
-    }
+    });
   });
 
   it("strips CLAUDE_CODE_SESSION but preserves CLAUDE_CODE_OAUTH_TOKEN", () => {
-    process.env.CLAUDE_CODE_SESSION = "strip-me";
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = "keep-me";
-    try {
+    withEnv({ CLAUDE_CODE_SESSION: "strip-me", CLAUDE_CODE_OAUTH_TOKEN: "keep-me" }, () => {
       const env = buildClaudeCodeEnv();
       assert.equal(env.CLAUDE_CODE_SESSION, undefined);
       assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "keep-me");
-    } finally {
-      delete process.env.CLAUDE_CODE_SESSION;
-      delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    }
+    });
   });
 
   it("logs warning when no auth source is present", () => {
-    const savedKey = process.env.ANTHROPIC_API_KEY;
-    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
-    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    delete process.env.ANTHROPIC_API_KEY;
-    delete process.env.ANTHROPIC_AUTH_TOKEN;
-    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-
-    const logs = [];
-    buildClaudeCodeEnv(undefined, (msg) => logs.push(msg));
-    assert.ok(logs.some(l => l.includes("no ANTHROPIC")), "should warn when no auth source");
-
-    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
-    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
-    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+    withEnv(NO_AUTH_ENV, () => {
+      const logs = [];
+      buildClaudeCodeEnv(undefined, (msg) => logs.push(msg));
+      assert.ok(logs.some(l => l.includes("no ANTHROPIC")), "should warn when no auth source");
+    });
   });
 
   it("routes no-auth warning to logWarn when provided", () => {
-    const savedKey = process.env.ANTHROPIC_API_KEY;
-    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
-    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    delete process.env.ANTHROPIC_API_KEY;
-    delete process.env.ANTHROPIC_AUTH_TOKEN;
-    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-
-    const debugLogs = [];
-    const warnLogs = [];
-    buildClaudeCodeEnv(undefined, (msg) => debugLogs.push(msg), (msg) => warnLogs.push(msg));
-    assert.ok(warnLogs.some(l => l.includes("no ANTHROPIC")), "warning should go to logWarn");
-    assert.ok(!debugLogs.some(l => l.includes("no ANTHROPIC")), "warning should not go to debug log");
-
-    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
-    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
-    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+    withEnv(NO_AUTH_ENV, () => {
+      const debugLogs = [];
+      const warnLogs = [];
+      buildClaudeCodeEnv(undefined, (msg) => debugLogs.push(msg), (msg) => warnLogs.push(msg));
+      assert.ok(warnLogs.some(l => l.includes("no ANTHROPIC")), "warning should go to logWarn");
+      assert.ok(!debugLogs.some(l => l.includes("no ANTHROPIC")), "warning should not go to debug log");
+    });
   });
 
   it("strips MCP_SESSION_ID", () => {
-    process.env.MCP_SESSION_ID = "strip-me";
-    try {
+    withEnv({ MCP_SESSION_ID: "strip-me" }, () => {
       const env = buildClaudeCodeEnv();
       assert.equal(env.MCP_SESSION_ID, undefined, "MCP_SESSION_ID should be stripped");
-    } finally {
-      delete process.env.MCP_SESSION_ID;
-    }
+    });
   });
 
   it("preserves CLAUDE_CODE_GIT_BASH_PATH", () => {
-    process.env.CLAUDE_CODE_GIT_BASH_PATH = "/usr/bin/bash";
-    try {
+    withEnv({ CLAUDE_CODE_GIT_BASH_PATH: "/usr/bin/bash" }, () => {
       const env = buildClaudeCodeEnv();
       assert.equal(env.CLAUDE_CODE_GIT_BASH_PATH, "/usr/bin/bash", "CLAUDE_CODE_GIT_BASH_PATH should be preserved");
-    } finally {
-      delete process.env.CLAUDE_CODE_GIT_BASH_PATH;
-    }
+    });
   });
 
   it("does not warn when ANTHROPIC_AUTH_TOKEN is present (subscription auth)", () => {
-    const savedKey = process.env.ANTHROPIC_API_KEY;
-    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
-    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    delete process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_AUTH_TOKEN = "claude-subscription-token";
-    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
-
-    const warnLogs = [];
-    buildClaudeCodeEnv(undefined, undefined, (msg) => warnLogs.push(msg));
-    assert.ok(
-      !warnLogs.some(l => l.includes("no ANTHROPIC")),
-      "should not warn when ANTHROPIC_AUTH_TOKEN is present",
-    );
-
-    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
-    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
-    else delete process.env.ANTHROPIC_AUTH_TOKEN;
-    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+    withEnv({ ...NO_AUTH_ENV, ANTHROPIC_AUTH_TOKEN: "claude-subscription-token" }, () => {
+      const warnLogs = [];
+      buildClaudeCodeEnv(undefined, undefined, (msg) => warnLogs.push(msg));
+      assert.ok(
+        !warnLogs.some(l => l.includes("no ANTHROPIC")),
+        "should not warn when ANTHROPIC_AUTH_TOKEN is present",
+      );
+    });
   });
 });
 
@@ -284,7 +251,6 @@ describe("createLlmClient claude-code", () => {
       "error should not appear in debug log when logWarn is provided");
   });
 });
-
 
 // ---------------------------------------------------------------------------
 // createLlmClient — factory auth routing (early validation)

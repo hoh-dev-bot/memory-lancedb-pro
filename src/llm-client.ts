@@ -80,6 +80,10 @@ function extractJsonFromResponse(text: string): string | null {
   return text.substring(firstBrace, lastBrace + 1);
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function previewText(value: string, maxLen = 200): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLen) return normalized;
@@ -194,7 +198,7 @@ function parseJsonWithRepair<T>(
   try {
     return { value: JSON.parse(jsonStr) as T, error: null };
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = errorMessage(err);
     const repairedJsonStr = repairCommonJson(jsonStr);
     if (repairedJsonStr !== jsonStr) {
       try {
@@ -204,7 +208,7 @@ function parseJsonWithRepair<T>(
         );
         return { value: repaired, error: null };
       } catch (repairErr) {
-        const repairMsg = repairErr instanceof Error ? repairErr.message : String(repairErr);
+        const repairMsg = errorMessage(repairErr);
         const error = `memory-lancedb-pro: llm-client [${label}] ${context} JSON.parse failed: ${errMsg}; repair failed: ${repairMsg} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
         return { value: null, error };
       }
@@ -244,9 +248,16 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
   });
   let lastError: string | null = null;
 
+  function fail(msg: string): null {
+    lastError = msg;
+    logWarn(msg);
+    return null;
+  }
+
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
+      const prefix = `memory-lancedb-pro: llm-client [${label}]`;
       try {
         const response = await client.chat.completions.create({
           model: config.model,
@@ -263,30 +274,17 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void,
 
         const raw = response.choices?.[0]?.message?.content;
         if (!raw) {
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] empty response content from model ${config.model}`;
-          logWarn(lastError);
-          return null;
+          return fail(`${prefix} empty response content from model ${config.model}`);
         }
         if (typeof raw !== "string") {
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] non-string response content type=${Array.isArray(raw) ? "array" : typeof raw} from model ${config.model}`;
-          logWarn(lastError);
-          return null;
+          return fail(`${prefix} non-string response content type=${Array.isArray(raw) ? "array" : typeof raw} from model ${config.model}`);
         }
 
         const parsed = parseJsonWithRepair<T>(raw, label, "api-key", log);
-        if (parsed.error) {
-          lastError = parsed.error;
-          logWarn(lastError);
-          return null;
-        }
+        if (parsed.error) return fail(parsed.error);
         return parsed.value;
       } catch (err) {
-        lastError =
-          `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        logWarn(lastError);
-        return null;
+        return fail(`${prefix} request failed for model ${config.model}: ${errorMessage(err)}`);
       }
     },
     getLastError(): string | null {
@@ -302,6 +300,12 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
 
   let cachedSessionPromise: Promise<Awaited<ReturnType<typeof loadOAuthSession>>> | null = null;
   let lastError: string | null = null;
+
+  function fail(msg: string): null {
+    lastError = msg;
+    logWarn(msg);
+    return null;
+  }
 
   async function getSession() {
     if (!cachedSessionPromise) {
@@ -322,6 +326,7 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
+      const prefix = `memory-lancedb-pro: llm-client [${label}]`;
       try {
         const session = await getSession();
         const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
@@ -388,34 +393,23 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
                   );
                   return typeof content?.text === "string" ? content.text : null;
                 } catch (parseErr) {
-                  lastError = `memory-lancedb-pro: llm-client [${label}] failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`;
-                  logWarn(lastError);
+                  fail(`${prefix} failed to parse OAuth response body: ${errorMessage(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`);
                   return null;
                 }
               })();
 
           if (!raw) {
-            lastError =
-              `memory-lancedb-pro: llm-client [${label}] empty OAuth response content from model ${config.model}`;
-            logWarn(lastError);
-            return null;
+            return fail(`${prefix} empty OAuth response content from model ${config.model}`);
           }
 
           const parsed = parseJsonWithRepair<T>(raw, label, "OAuth", log);
-          if (parsed.error) {
-            lastError = parsed.error;
-            logWarn(lastError);
-            return null;
-          }
+          if (parsed.error) return fail(parsed.error);
           return parsed.value;
         } finally {
           dispose();
         }
       } catch (err) {
-        lastError =
-          `memory-lancedb-pro: llm-client [${label}] OAuth request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
-        logWarn(lastError);
-        return null;
+        return fail(`${prefix} OAuth request failed for model ${config.model}: ${errorMessage(err)}`);
       }
     },
     getLastError(): string | null {
@@ -495,7 +489,7 @@ function resolveClaudeExecutable(configuredPath?: string): string {
     try {
       accessSync(configuredPath, fsConstants.X_OK);
     } catch (accessErr) {
-      const reason = accessErr instanceof Error ? accessErr.message : String(accessErr);
+      const reason = errorMessage(accessErr);
       throw new Error(`claude executable at configured path ${configuredPath} is not accessible: ${reason}`);
     }
     return configuredPath;
@@ -512,7 +506,7 @@ function resolveClaudeExecutable(configuredPath?: string): string {
     }
     return firstLine;
   } catch (execErr) {
-    const reason = execErr instanceof Error ? execErr.message : String(execErr);
+    const reason = errorMessage(execErr);
     throw new Error(
       `Could not find the 'claude' executable (${reason}). ` +
       "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
@@ -554,18 +548,22 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
   let cachedQueryFn: ((typeof import("@anthropic-ai/claude-agent-sdk"))["query"]) | undefined;
   let cachedSdkError: string | null = null;
 
+  /** Set lastError, log it, return null — the common failure exit for completeJson. */
+  function fail(msg: string): null {
+    lastError = msg;
+    logWarn(msg);
+    return null;
+  }
+
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
 
+      const prefix = `memory-lancedb-pro: llm-client [${label}]`;
+
       // Dynamic import — optional dep; gives a clear error if not installed.
-      // Both success (queryFn) and failure (cachedSdkError) are cached so
-      // repeated calls don't re-import or retry a broken/missing module.
-      if (cachedSdkError) {
-        lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
-        logWarn(lastError);
-        return null;
-      }
+      // Both success and failure are cached so repeated calls skip re-import.
+      if (cachedSdkError) return fail(`${prefix} ${cachedSdkError}`);
       if (!cachedQueryFn) {
         try {
           const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -579,34 +577,22 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             (("code" in importErr && (importErr as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") ||
               importErr.message.includes("Cannot find module") ||
               importErr.message.includes("Cannot find package"));
-          if (isNotFound) {
-            cachedSdkError = "@anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
-          } else {
-            cachedSdkError = `failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
-          }
-          lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedSdkError}`;
-          logWarn(lastError);
-          return null;
+          cachedSdkError = isNotFound
+            ? "@anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk"
+            : `failed to load @anthropic-ai/claude-agent-sdk: ${errorMessage(importErr)}`;
+          return fail(`${prefix} ${cachedSdkError}`);
         }
       }
       const queryFn = cachedQueryFn;
 
       // Resolve claude binary (cached per client instance; failure also cached).
-      // The error is stored without a label so replayed errors are not misleadingly
-      // tagged with the label from the first failing call.
-      if (cachedClaudePathError) {
-        lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
-        logWarn(lastError);
-        return null;
-      }
+      if (cachedClaudePathError) return fail(`${prefix} ${cachedClaudePathError}`);
       if (!cachedClaudePath) {
         try {
           cachedClaudePath = resolveClaudeExecutable(config.claudeCodePath);
         } catch (err) {
-          cachedClaudePathError = err instanceof Error ? err.message : String(err);
-          lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
-          logWarn(lastError);
-          return null;
+          cachedClaudePathError = errorMessage(err);
+          return fail(`${prefix} ${cachedClaudePathError}`);
         }
       }
       const claudePath = cachedClaudePath;
@@ -614,20 +600,16 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       // Isolated cwd to keep memory-agent sessions out of user's claude history
       const sessionDir = join(config.stateDir ?? join(homedir(), ".openclaw", "memory-lancedb-pro"), "claude-code-sessions");
       try {
-        mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
+        mkdirSync(sessionDir, { recursive: true });
       } catch (err) {
-        lastError = `memory-lancedb-pro: llm-client [${label}] failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : String(err)}`;
-        logWarn(lastError);
-        return null;
+        return fail(`${prefix} failed to create session dir ${sessionDir}: ${errorMessage(err)}`);
       }
 
       const env = buildClaudeCodeEnv(config.apiKey, log, logWarn);
       const model = config.model;
+      const { signal, dispose } = createTimeoutSignal(config.timeoutMs);
+      const abortController = { signal } as AbortController;
 
-      const effectiveTimeoutMs = resolveTimeoutMs(config.timeoutMs);
-      const abortController = new AbortController();
-      const timeoutTimer = setTimeout(() => abortController.abort(), effectiveTimeoutMs);
-      const disposeTimeout = () => clearTimeout(timeoutTimer);
       try {
         const result = queryFn({
           prompt,
@@ -642,56 +624,40 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         });
 
         // Collect the final result from the SDK stream.
-        // We prefer the `result` message (subtype=success) which contains the
-        // aggregated assistant output. SDKResultError subtypes (error_during_execution,
-        // error_max_turns, error_max_budget_usd) are surfaced explicitly.
-        // Falling back to the last `assistant` message handles edge cases where `result` is absent.
+        // Prefer the `result` message (subtype=success); fall back to last `assistant` text.
         let raw: string | null = null;
         for await (const message of result) {
           if (message.type === "result") {
             const msg = message as { subtype?: string; result?: string; errors?: unknown[] };
             if (msg.subtype !== "success") {
-              // Subprocess reported an error (auth failure, budget exceeded, etc.)
               const errorDetail = Array.isArray(msg.errors) && msg.errors.length > 0
                 ? msg.errors.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("; ")
                 : (msg.subtype ?? "unknown");
-              lastError = `memory-lancedb-pro: llm-client [${label}] claude-code subprocess failed (subtype=${msg.subtype ?? "unknown"}): ${errorDetail}`;
-              logWarn(lastError);
-              return null;
+              return fail(`${prefix} claude-code subprocess failed (subtype=${msg.subtype ?? "unknown"}): ${errorDetail}`);
             }
             raw = typeof msg.result === "string" ? msg.result : null;
             break;
           }
           if (message.type === "assistant") {
             const text = extractTextFromSdkMessage(message);
-            if (text) raw = text; // keep last assistant text as fallback
+            if (text) raw = text;
           }
         }
 
         if (!raw) {
-          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code returned empty response for model ${model}`;
-          logWarn(lastError);
-          return null;
+          return fail(`${prefix} claude-code returned empty response for model ${model}`);
         }
 
         const parsed = parseJsonWithRepair<T>(raw, label, "claude-code", log);
-        if (parsed.error) {
-          lastError = parsed.error;
-          logWarn(lastError);
-          return null;
-        }
+        if (parsed.error) return fail(parsed.error);
         return parsed.value;
       } catch (err) {
-        const isAbort = err instanceof Error && err.name === "AbortError";
-        if (isAbort) {
-          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code timed out after ${effectiveTimeoutMs}ms for model ${model}. Increase llm.timeoutMs if needed.`;
-        } else {
-          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
+        if (err instanceof Error && err.name === "AbortError") {
+          return fail(`${prefix} claude-code timed out after ${resolveTimeoutMs(config.timeoutMs)}ms for model ${model}. Increase llm.timeoutMs if needed.`);
         }
-        logWarn(lastError);
-        return null;
+        return fail(`${prefix} claude-code request failed for model ${model}: ${errorMessage(err)}`);
       } finally {
-        disposeTimeout();
+        dispose();
       }
     },
     getLastError(): string | null {
