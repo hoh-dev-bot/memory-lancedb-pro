@@ -46,5 +46,8 @@
     "commander": "^14.0.0",
     "jiti": "^2.6.0",
     "typescript": "^5.9.3"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.88"
   }
 }

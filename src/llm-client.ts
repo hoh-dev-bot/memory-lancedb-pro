@@ -1,8 +1,12 @@
 /**
  * LLM Client for memory extraction and dedup decisions.
- * Uses OpenAI-compatible API (reuses the embedding provider config).
+ * Supports OpenAI-compatible API, Claude Code subprocess, and OAuth.
  */
 
+import { execSync } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import OpenAI from "openai";
 import {
   buildOauthEndpoint,
@@ -18,11 +22,23 @@ export interface LlmClientConfig {
   apiKey?: string;
   model: string;
   baseURL?: string;
-  auth?: "api-key" | "oauth";
+  /**
+   * LLM provider type.
+   * - "api-key" (default): OpenAI-compatible endpoint (openai npm package)
+   * - "claude-code": Spawn a local Claude Code subprocess via @anthropic-ai/claude-agent-sdk.
+   *     No apiKey/baseURL required; uses ambient Claude Code auth (subscription or ANTHROPIC_API_KEY).
+   *     Requires @anthropic-ai/claude-agent-sdk to be installed.
+   * - "oauth": OAuth-based endpoint (e.g. ChatGPT)
+   */
+  auth?: "api-key" | "claude-code" | "oauth";
+  /** Path to the claude executable. Only used when auth="claude-code". Auto-detected if not set. */
+  claudeCodePath?: string;
   oauthPath?: string;
   oauthProvider?: string;
   timeoutMs?: number;
   log?: (msg: string) => void;
+  /** Plugin state directory. Used by claude-code auth to create an isolated cwd for subprocess sessions. */
+  stateDir?: string;
 }
 
 export interface LlmClient {
@@ -410,10 +426,172 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
   };
 }
 
+// ---------------------------------------------------------------------------
+// Claude Code subprocess client
+// ---------------------------------------------------------------------------
+
+/** Env var prefixes / exact keys that must be stripped to avoid
+ *  "cannot be launched inside another Claude Code session" errors.
+ *  Mirrors the logic in claude-mem's env-sanitizer.ts.
+ */
+const CLAUDE_CODE_STRIP_PREFIXES = ["CLAUDECODE_", "CLAUDE_CODE_"];
+const CLAUDE_CODE_STRIP_EXACT = new Set(["CLAUDECODE", "CLAUDE_CODE_SESSION", "CLAUDE_CODE_ENTRYPOINT", "MCP_SESSION_ID"]);
+/** Keys that start with CLAUDE_CODE_ but must be preserved for subprocess auth */
+const CLAUDE_CODE_PRESERVE = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"]);
+/** Keys to always strip — prevent accidental billing via project .env ANTHROPIC_API_KEY */
+const CLAUDE_CODE_BLOCK_EXACT = new Set(["ANTHROPIC_API_KEY"]);
+
+function buildClaudeCodeEnv(explicitApiKey?: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (CLAUDE_CODE_BLOCK_EXACT.has(k)) continue;
+    if (CLAUDE_CODE_PRESERVE.has(k)) { env[k] = v; continue; }
+    if (CLAUDE_CODE_STRIP_EXACT.has(k)) continue;
+    if (CLAUDE_CODE_STRIP_PREFIXES.some(p => k.startsWith(p))) continue;
+    env[k] = v;
+  }
+  // Mark as SDK subprocess to prevent "nested Claude Code" errors
+  env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts";
+  // Re-inject explicit API key if provided (takes precedence over ambient auth)
+  if (explicitApiKey) env["ANTHROPIC_API_KEY"] = explicitApiKey;
+  return env;
+}
+
+function resolveClaudeExecutable(configuredPath?: string): string {
+  if (configuredPath) return configuredPath;
+  try {
+    const cmd = process.platform === "win32" ? "where claude.cmd" : "which claude";
+    return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    throw new Error(
+      "Could not find the 'claude' executable. " +
+      "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
+    );
+  }
+}
+
+function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
+  let lastError: string | null = null;
+
+  return {
+    async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
+      lastError = null;
+
+      // Dynamic import — optional dep; gives a clear error if not installed
+      let queryFn: (typeof import("@anthropic-ai/claude-agent-sdk"))["query"];
+      try {
+        const sdk = await import("@anthropic-ai/claude-agent-sdk");
+        queryFn = sdk.query;
+      } catch {
+        lastError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
+        log(lastError);
+        return null;
+      }
+
+      // Resolve claude binary
+      let claudePath: string;
+      try {
+        claudePath = resolveClaudeExecutable(config.claudeCodePath);
+      } catch (err) {
+        lastError = `memory-lancedb-pro: llm-client [${label}] ${err instanceof Error ? err.message : String(err)}`;
+        log(lastError);
+        return null;
+      }
+
+      // Isolated cwd to keep memory-agent sessions out of user's claude history
+      const sessionDir = join(config.stateDir ?? join(homedir(), ".openclaw", "memory-lancedb-pro"), "claude-code-sessions");
+      try { mkdirSync(sessionDir, { recursive: true }); } catch { /* already exists */ }
+
+      const env = buildClaudeCodeEnv(config.apiKey);
+      const model = config.model || "claude-sonnet-4-5";
+
+      // Tools we never want the memory subprocess to use
+      const disallowedTools = [
+        "Bash", "Read", "Write", "Edit", "MultiEdit", "Grep", "Glob",
+        "WebFetch", "WebSearch", "Task", "NotebookEdit",
+        "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
+      ];
+
+      try {
+        const result = queryFn({
+          prompt,
+          options: {
+            model,
+            cwd: sessionDir,
+            pathToClaudeCodeExecutable: claudePath,
+            disallowedTools,
+            env,
+          },
+        });
+
+        let raw: string | null = null;
+        for await (const message of result) {
+          if (message.type === "assistant") {
+            const content = message.message?.content;
+            if (Array.isArray(content)) {
+              raw = content
+                .filter((b: { type: string }) => b.type === "text")
+                .map((b: { type: string; text?: string }) => b.text ?? "")
+                .join("\n");
+            } else if (typeof content === "string") {
+              raw = content;
+            }
+            break; // We only need the first assistant response
+          }
+        }
+
+        if (!raw) {
+          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code returned empty response for model ${model}`;
+          log(lastError);
+          return null;
+        }
+
+        const jsonStr = extractJsonFromResponse(raw);
+        if (!jsonStr) {
+          lastError = `memory-lancedb-pro: llm-client [${label}] no JSON found in claude-code response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+          log(lastError);
+          return null;
+        }
+
+        try {
+          return JSON.parse(jsonStr) as T;
+        } catch (err) {
+          const repairedJsonStr = repairCommonJson(jsonStr);
+          if (repairedJsonStr !== jsonStr) {
+            try {
+              const repaired = JSON.parse(repairedJsonStr) as T;
+              log(`memory-lancedb-pro: llm-client [${label}] recovered malformed claude-code JSON via repair (jsonChars=${jsonStr.length})`);
+              return repaired;
+            } catch (repairErr) {
+              lastError = `memory-lancedb-pro: llm-client [${label}] claude-code JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}`;
+              log(lastError);
+              return null;
+            }
+          }
+          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (preview=${JSON.stringify(previewText(jsonStr))})`;
+          log(lastError);
+          return null;
+        }
+      } catch (err) {
+        lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
+        log(lastError);
+        return null;
+      }
+    },
+    getLastError(): string | null {
+      return lastError;
+    },
+  };
+}
+
 export function createLlmClient(config: LlmClientConfig): LlmClient {
   const log = config.log ?? (() => {});
   if (config.auth === "oauth") {
     return createOauthClient(config, log);
+  }
+  if (config.auth === "claude-code") {
+    return createClaudeCodeClient(config, log);
   }
   return createApiKeyClient(config, log);
 }
