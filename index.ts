@@ -2091,7 +2091,6 @@ const memoryLanceDBProPlugin = {
         enableSelfImprovementTools: config.selfImprovement?.enabled !== false,
       }
     );
-    }
 
     // Auto-compaction at gateway_start (if enabled, respects cooldown)
     if (config.memoryCompaction?.enabled) {
