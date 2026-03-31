@@ -152,7 +152,7 @@ try {
   plugin.register(api);
   assert.equal(services.length, 1, "plugin should register its background service");
   assert.equal(typeof api.hooks.agent_end, "function", "autoCapture should remain enabled by default");
-  assert.equal(api.hooks["command:new"], undefined, "sessionMemory should stay disabled by default");
+  assert.equal(typeof api.hooks["command:new"], "function", "selfImprovement registers command:new hook by default (selfImprovement.enabled defaults to true)");
   await assert.doesNotReject(
     services[0].stop(),
     "service stop should not throw when no access tracker is configured",
@@ -163,6 +163,7 @@ try {
     autoCapture: false,
     autoRecall: false,
     sessionMemory: {},
+    selfImprovement: { enabled: false },
     embedding: {
       provider: "openai-compatible",
       apiKey: "dummy",
@@ -183,6 +184,7 @@ try {
     autoCapture: false,
     autoRecall: false,
     sessionMemory: { enabled: true },
+    selfImprovement: { enabled: false },
     embedding: {
       provider: "openai-compatible",
       apiKey: "dummy",
