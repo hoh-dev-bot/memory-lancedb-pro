@@ -367,7 +367,9 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
                     (part) => part?.type === "output_text" && typeof part.text === "string",
                   );
                   return typeof content?.text === "string" ? content.text : null;
-                } catch {
+                } catch (parseErr) {
+                  lastError = `memory-lancedb-pro: llm-client [${label}] failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`;
+                  log(lastError);
                   return null;
                 }
               })();
@@ -500,6 +502,8 @@ function resolveClaudeExecutable(configuredPath?: string): string {
 
 function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
+  // Cache the resolved claude path so we don't fork a shell on every request
+  let cachedClaudePath: string | undefined;
 
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
@@ -509,34 +513,43 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       let queryFn: (typeof import("@anthropic-ai/claude-agent-sdk"))["query"];
       try {
         const sdk = await import("@anthropic-ai/claude-agent-sdk");
+        if (typeof sdk.query !== "function") {
+          throw new Error("sdk.query is not a function — package may be corrupted or incompatible");
+        }
         queryFn = sdk.query;
-      } catch {
-        lastError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
+      } catch (importErr) {
+        const isNotFound =
+          importErr instanceof Error &&
+          (("code" in importErr && (importErr as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND") ||
+            importErr.message.includes("Cannot find module") ||
+            importErr.message.includes("Cannot find package"));
+        if (isNotFound) {
+          lastError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
+        } else {
+          lastError = `memory-lancedb-pro: llm-client [claude-code] failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
+        }
         log(lastError);
         return null;
       }
 
-      // Resolve claude binary
-      let claudePath: string;
+      // Resolve claude binary (cached per client instance)
       try {
-        claudePath = resolveClaudeExecutable(config.claudeCodePath);
+        cachedClaudePath ??= resolveClaudeExecutable(config.claudeCodePath);
       } catch (err) {
         lastError = `memory-lancedb-pro: llm-client [${label}] ${err instanceof Error ? err.message : String(err)}`;
         log(lastError);
         return null;
       }
+      const claudePath = cachedClaudePath;
 
       // Isolated cwd to keep memory-agent sessions out of user's claude history
       const sessionDir = join(config.stateDir ?? join(homedir(), ".openclaw", "memory-lancedb-pro"), "claude-code-sessions");
       try {
-        mkdirSync(sessionDir, { recursive: true });
+        mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
       } catch (err) {
-        // Only ignore EEXIST (directory already exists); surface real errors (e.g. EACCES)
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-          lastError = `memory-lancedb-pro: llm-client [${label}] failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : String(err)}`;
-          log(lastError);
-          return null;
-        }
+        lastError = `memory-lancedb-pro: llm-client [${label}] failed to create session dir ${sessionDir}: ${err instanceof Error ? err.message : String(err)}`;
+        log(lastError);
+        return null;
       }
 
       const env = buildClaudeCodeEnv(config.apiKey, log);
@@ -549,6 +562,13 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
       ];
 
+      const effectiveTimeoutMs =
+        typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
+          ? config.timeoutMs
+          : 30_000;
+      const abortController = new AbortController();
+      const timeoutTimer = setTimeout(() => abortController.abort(), effectiveTimeoutMs);
+      const disposeTimeout = () => clearTimeout(timeoutTimer);
       try {
         const result = queryFn({
           prompt,
@@ -558,20 +578,29 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             pathToClaudeCodeExecutable: claudePath,
             disallowedTools,
             env,
+            abortController,
           },
         });
 
         // Collect the final result from the SDK stream.
         // We prefer the `result` message (subtype=success) which contains the
-        // aggregated assistant output. Falling back to the last `assistant`
-        // message handles edge cases where `result` is absent.
+        // aggregated assistant output. SDKResultError subtypes (error_during_execution,
+        // error_max_turns, error_max_budget_usd) are surfaced explicitly.
+        // Falling back to the last `assistant` message handles edge cases where `result` is absent.
         let raw: string | null = null;
         for await (const message of result) {
           if (message.type === "result") {
-            // `result.result` is the final aggregated text output
-            if (typeof (message as { result?: string }).result === "string") {
-              raw = (message as { result: string }).result;
+            const msg = message as { subtype?: string; result?: string; errors?: unknown[] };
+            if (msg.subtype !== "success") {
+              // Subprocess reported an error (auth failure, budget exceeded, etc.)
+              const errorDetail = Array.isArray(msg.errors) && msg.errors.length > 0
+                ? msg.errors.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join("; ")
+                : (msg.subtype ?? "unknown");
+              lastError = `memory-lancedb-pro: llm-client [${label}] claude-code subprocess failed (subtype=${msg.subtype ?? "unknown"}): ${errorDetail}`;
+              log(lastError);
+              return null;
             }
+            raw = typeof msg.result === "string" ? msg.result : null;
             break;
           }
           if (message.type === "assistant") {
@@ -624,6 +653,8 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
         log(lastError);
         return null;
+      } finally {
+        disposeTimeout();
       }
     },
     getLastError(): string | null {
