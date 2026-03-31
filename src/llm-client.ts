@@ -495,7 +495,7 @@ function resolveClaudeExecutable(configuredPath?: string): string {
     return configuredPath;
   }
   try {
-    const cmd = process.platform === "win32" ? "where claude.cmd" : "which claude";
+    const cmd = process.platform === "win32" ? "where claude" : "which claude";
     return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   } catch (execErr) {
     const reason = execErr instanceof Error ? execErr.message : String(execErr);
@@ -510,14 +510,24 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
   let lastError: string | null = null;
   // Cache the resolved claude path — and any resolution failure — so we don't
   // fork a shell on every request even after a permanent failure.
+  // NOTE: cachedClaudePathError is stored WITHOUT a per-call label to avoid
+  // replaying a stale label from the first failing call into subsequent calls.
   let cachedClaudePath: string | undefined;
   let cachedClaudePathError: string | null = null;
+  // Cache SDK import failure similarly — no need to retry a missing/broken module.
+  let cachedSdkError: string | null = null;
 
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
       lastError = null;
 
-      // Dynamic import — optional dep; gives a clear error if not installed
+      // Dynamic import — optional dep; gives a clear error if not installed.
+      // Failure is cached so repeated calls don't retry a broken/missing module.
+      if (cachedSdkError) {
+        lastError = cachedSdkError;
+        log(lastError);
+        return null;
+      }
       let queryFn: (typeof import("@anthropic-ai/claude-agent-sdk"))["query"];
       try {
         const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -532,17 +542,20 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             importErr.message.includes("Cannot find module") ||
             importErr.message.includes("Cannot find package"));
         if (isNotFound) {
-          lastError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
+          cachedSdkError = "memory-lancedb-pro: llm-client [claude-code] @anthropic-ai/claude-agent-sdk is not installed. Run: npm i @anthropic-ai/claude-agent-sdk";
         } else {
-          lastError = `memory-lancedb-pro: llm-client [claude-code] failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
+          cachedSdkError = `memory-lancedb-pro: llm-client [claude-code] failed to load @anthropic-ai/claude-agent-sdk: ${importErr instanceof Error ? importErr.message : String(importErr)}`;
         }
+        lastError = cachedSdkError;
         log(lastError);
         return null;
       }
 
-      // Resolve claude binary (cached per client instance; failure also cached)
+      // Resolve claude binary (cached per client instance; failure also cached).
+      // The error is stored without a label so replayed errors are not misleadingly
+      // tagged with the label from the first failing call.
       if (cachedClaudePathError) {
-        lastError = cachedClaudePathError;
+        lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
         log(lastError);
         return null;
       }
@@ -550,8 +563,8 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         try {
           cachedClaudePath = resolveClaudeExecutable(config.claudeCodePath);
         } catch (err) {
-          cachedClaudePathError = `memory-lancedb-pro: llm-client [${label}] ${err instanceof Error ? err.message : String(err)}`;
-          lastError = cachedClaudePathError;
+          cachedClaudePathError = err instanceof Error ? err.message : String(err);
+          lastError = `memory-lancedb-pro: llm-client [${label}] ${cachedClaudePathError}`;
           log(lastError);
           return null;
         }

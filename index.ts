@@ -347,7 +347,7 @@ function resolveLlmClientConfig(
     claudeCodePath,
     stateDir: api.resolvePath("."),
     timeoutMs: resolveLlmTimeoutMs(config),
-    log: (msg: string) => api.logger.debug(msg),
+    log: (msg: string) => msg.includes("WARNING") ? api.logger.warn(msg) : api.logger.debug(msg),
   };
 }
 
@@ -2216,7 +2216,10 @@ const memoryLanceDBProPlugin = {
         llmClient: smartExtractor ? (() => {
           try {
             return createLlmClient(resolveLlmClientConfig(config, api));
-          } catch { return undefined; }
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: failed to create LLM client for CLI: ${err instanceof Error ? err.message : String(err)}`);
+            return undefined;
+          }
         })() : undefined,
       }),
       { commands: ["memory-pro"] },
