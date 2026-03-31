@@ -473,13 +473,20 @@ export function buildClaudeCodeEnv(
     const settingsPath = join(homedir(), ".claude", "settings.json");
     const settingsRaw = readFileSync(settingsPath, "utf-8");
     const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
-    if (settings.env) {
+    if (settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)) {
       for (const [k, v] of Object.entries(settings.env)) {
-        if (typeof v === "string") env[k] = v;
+        // Skip strip-listed keys to prevent nested session issues
+        if (typeof v === "string" && !shouldStripClaudeCodeEnvKey(k)) {
+          env[k] = v;
+        }
       }
     }
-  } catch {
-    // settings.json not found or parse error — continue with ambient env only
+  } catch (settingsErr) {
+    const code = (settingsErr as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      // ENOENT (file not found) is expected; other errors (SyntaxError, permission) should warn
+      warn?.(`memory-lancedb-pro: llm-client [claude-code] failed to load ~/.claude/settings.json (${settingsErr instanceof Error ? settingsErr.message : String(settingsErr)}) — falling back to ambient environment only`);
+    }
   }
 
   for (const [k, v] of Object.entries(process.env)) {
