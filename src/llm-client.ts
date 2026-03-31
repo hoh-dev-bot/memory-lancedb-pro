@@ -4,7 +4,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import OpenAI from "openai";
@@ -488,13 +488,19 @@ export function buildClaudeCodeEnv(
 }
 
 function resolveClaudeExecutable(configuredPath?: string): string {
-  if (configuredPath) return configuredPath;
+  if (configuredPath) {
+    if (!existsSync(configuredPath)) {
+      throw new Error(`claude executable not found at configured path: ${configuredPath}`);
+    }
+    return configuredPath;
+  }
   try {
     const cmd = process.platform === "win32" ? "where claude.cmd" : "which claude";
     return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-  } catch {
+  } catch (execErr) {
+    const reason = execErr instanceof Error ? execErr.message : String(execErr);
     throw new Error(
-      "Could not find the 'claude' executable. " +
+      `Could not find the 'claude' executable (${reason}). ` +
       "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
     );
   }
@@ -502,8 +508,10 @@ function resolveClaudeExecutable(configuredPath?: string): string {
 
 function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
-  // Cache the resolved claude path so we don't fork a shell on every request
+  // Cache the resolved claude path — and any resolution failure — so we don't
+  // fork a shell on every request even after a permanent failure.
   let cachedClaudePath: string | undefined;
+  let cachedClaudePathError: string | null = null;
 
   return {
     async completeJson<T>(prompt: string, label = "generic"): Promise<T | null> {
@@ -532,13 +540,21 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         return null;
       }
 
-      // Resolve claude binary (cached per client instance)
-      try {
-        cachedClaudePath ??= resolveClaudeExecutable(config.claudeCodePath);
-      } catch (err) {
-        lastError = `memory-lancedb-pro: llm-client [${label}] ${err instanceof Error ? err.message : String(err)}`;
+      // Resolve claude binary (cached per client instance; failure also cached)
+      if (cachedClaudePathError) {
+        lastError = cachedClaudePathError;
         log(lastError);
         return null;
+      }
+      if (!cachedClaudePath) {
+        try {
+          cachedClaudePath = resolveClaudeExecutable(config.claudeCodePath);
+        } catch (err) {
+          cachedClaudePathError = `memory-lancedb-pro: llm-client [${label}] ${err instanceof Error ? err.message : String(err)}`;
+          lastError = cachedClaudePathError;
+          log(lastError);
+          return null;
+        }
       }
       const claudePath = cachedClaudePath;
 
@@ -650,7 +666,12 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           return null;
         }
       } catch (err) {
-        lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
+        const isAbort = err instanceof Error && err.name === "AbortError";
+        if (isAbort) {
+          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code timed out after ${effectiveTimeoutMs}ms for model ${model}. Increase llm.timeoutMs if needed.`;
+        } else {
+          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code request failed for model ${model}: ${err instanceof Error ? err.message : String(err)}`;
+        }
         log(lastError);
         return null;
       } finally {

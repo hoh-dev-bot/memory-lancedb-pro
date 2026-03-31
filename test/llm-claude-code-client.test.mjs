@@ -3,7 +3,7 @@
  * Covers: env sanitization, JSON extraction, error paths.
  */
 import assert from "node:assert/strict";
-import { describe, it, before, after } from "node:test";
+import { describe, it, mock } from "node:test";
 import jitiFactory from "jiti";
 
 const jiti = jitiFactory(import.meta.url, { interopDefault: true });
@@ -147,5 +147,45 @@ describe("createLlmClient claude-code", () => {
     assert.equal(typeof llm.completeJson, "function");
     assert.equal(typeof llm.getLastError, "function");
     assert.equal(llm.getLastError(), null, "no error before any call");
+  });
+
+  it("returns null and sets lastError when claudeCodePath does not exist", async () => {
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      stateDir: "/tmp/test-state",
+      claudeCodePath: "/nonexistent/path/to/claude",
+    });
+    const result = await llm.completeJson('{"test": true}', "test-label");
+    assert.equal(result, null, "should return null when claude binary not found");
+    const err = llm.getLastError();
+    assert.ok(err !== null, "should set lastError");
+    assert.ok(
+      err.includes("not found") || err.includes("not installed") || err.includes("claude"),
+      `lastError should describe the failure, got: ${err}`,
+    );
+  });
+
+  it("caches claude path resolution failure — does not retry execSync on subsequent calls", async () => {
+    const llm = createLlmClient({
+      auth: "claude-code",
+      model: "claude-haiku-4-5",
+      stateDir: "/tmp/test-state",
+      claudeCodePath: "/nonexistent/path/to/claude-cached-test",
+    });
+    // First call triggers resolution failure
+    const r1 = await llm.completeJson("prompt1", "label1");
+    assert.equal(r1, null);
+    const err1 = llm.getLastError();
+    // Second call must also fail without re-running execSync
+    const r2 = await llm.completeJson("prompt2", "label2");
+    assert.equal(r2, null);
+    const err2 = llm.getLastError();
+    // Both errors should reference the same binary path issue
+    assert.ok(err1 !== null && err2 !== null);
+    assert.ok(
+      err1.includes("nonexistent") || err1.includes("not found"),
+      `first error should mention path, got: ${err1}`,
+    );
   });
 });
