@@ -612,7 +612,10 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const claudePath = cachedClaudePath;
 
       // Isolated cwd to keep memory-agent sessions out of user's claude history
-      const sessionDir = join(config.stateDir ?? join(homedir(), ".openclaw", "memory-lancedb-pro"), "claude-code-sessions");
+      const baseDir = (config.stateDir && config.stateDir.length > 1)
+        ? config.stateDir
+        : join(homedir(), ".openclaw", "memory-lancedb-pro");
+      const sessionDir = join(baseDir, "claude-code-sessions");
       try {
         mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
       } catch (err) {
