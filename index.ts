@@ -314,28 +314,36 @@ function resolveLlmClientConfig(
   api: Pick<OpenClawPluginApi, "resolvePath" | "logger">,
 ): Parameters<typeof createLlmClient>[0] {
   const llmAuth = config.llm?.auth || "api-key";
-  const isClaudeCode = llmAuth === "claude-code";
-  const isOauth = llmAuth === "oauth";
 
-  const apiKey = (isOauth || isClaudeCode)
-    ? (isClaudeCode && config.llm?.apiKey ? resolveEnvVars(config.llm.apiKey) : undefined)
-    : config.llm?.apiKey
-      ? resolveEnvVars(config.llm.apiKey)
-      : resolveFirstApiKey(config.embedding.apiKey);
+  let apiKey: string | undefined;
+  let baseURL: string | undefined;
+  let model: string;
+  let oauthPath: string | undefined;
+  let oauthProvider: string | undefined;
+  let claudeCodePath: string | undefined;
 
-  const baseURL = (isOauth || isClaudeCode)
-    ? (isOauth && config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
-    : config.llm?.baseURL
-      ? resolveEnvVars(config.llm.baseURL)
-      : config.embedding.baseURL;
-
-  const model = config.llm?.model || (isClaudeCode ? "claude-sonnet-4-5" : "openai/gpt-oss-120b");
-
-  const oauthPath = isOauth
-    ? resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json")
-    : undefined;
-  const oauthProvider = isOauth ? config.llm?.oauthProvider : undefined;
-  const claudeCodePath = isClaudeCode ? config.llm?.claudeCodePath : undefined;
+  switch (llmAuth) {
+    case "claude-code":
+      apiKey = config.llm?.apiKey ? resolveEnvVars(config.llm.apiKey) : undefined;
+      model = config.llm?.model || "claude-sonnet-4-5";
+      claudeCodePath = config.llm?.claudeCodePath;
+      break;
+    case "oauth":
+      baseURL = config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined;
+      model = config.llm?.model || "openai/gpt-oss-120b";
+      oauthPath = resolveOptionalPathWithEnv(api, config.llm?.oauthPath, ".memory-lancedb-pro/oauth.json");
+      oauthProvider = config.llm?.oauthProvider;
+      break;
+    default: // "api-key"
+      apiKey = config.llm?.apiKey
+        ? resolveEnvVars(config.llm.apiKey)
+        : resolveFirstApiKey(config.embedding.apiKey);
+      baseURL = config.llm?.baseURL
+        ? resolveEnvVars(config.llm.baseURL)
+        : config.embedding.baseURL;
+      model = config.llm?.model || "openai/gpt-oss-120b";
+      break;
+  }
 
   return {
     auth: llmAuth,

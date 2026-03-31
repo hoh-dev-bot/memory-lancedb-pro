@@ -172,16 +172,58 @@ function repairCommonJson(text: string): string {
   return result;
 }
 
+/**
+ * Extract JSON from raw LLM text, parse it, and attempt heuristic repair on failure.
+ * Returns { value, error } — exactly one will be set.
+ * Shared by all client implementations to eliminate the duplicated parse-repair block.
+ */
+function parseJsonWithRepair<T>(
+  raw: string,
+  label: string,
+  context: string,
+  log: (msg: string) => void,
+): { value: T; error: null } | { value: null; error: string } {
+  const jsonStr = extractJsonFromResponse(raw);
+  if (!jsonStr) {
+    const error = `memory-lancedb-pro: llm-client [${label}] no JSON found in ${context} response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+    return { value: null, error };
+  }
+
+  try {
+    return { value: JSON.parse(jsonStr) as T, error: null };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const repairedJsonStr = repairCommonJson(jsonStr);
+    if (repairedJsonStr !== jsonStr) {
+      try {
+        const repaired = JSON.parse(repairedJsonStr) as T;
+        log(
+          `memory-lancedb-pro: llm-client [${label}] recovered malformed ${context} JSON via heuristic repair (jsonChars=${jsonStr.length})`,
+        );
+        return { value: repaired, error: null };
+      } catch (repairErr) {
+        const repairMsg = repairErr instanceof Error ? repairErr.message : String(repairErr);
+        const error = `memory-lancedb-pro: llm-client [${label}] ${context} JSON.parse failed: ${errMsg}; repair failed: ${repairMsg} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+        return { value: null, error };
+      }
+    }
+    const error = `memory-lancedb-pro: llm-client [${label}] ${context} JSON.parse failed: ${errMsg} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+    return { value: null, error };
+  }
+}
+
 function looksLikeSseResponse(bodyText: string): boolean {
   const trimmed = bodyText.trimStart();
   return trimmed.startsWith("event:") || trimmed.startsWith("data:");
 }
 
+function resolveTimeoutMs(timeoutMs?: number): number {
+  return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+}
+
 function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose: () => void } {
-  const effectiveTimeoutMs =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
+  const timer = setTimeout(() => controller.abort(), resolveTimeoutMs(timeoutMs));
   return {
     signal: controller.signal,
     dispose: () => clearTimeout(timer),
@@ -231,37 +273,13 @@ function createApiKeyClient(config: LlmClientConfig, log: (msg: string) => void)
           return null;
         }
 
-        const jsonStr = extractJsonFromResponse(raw);
-        if (!jsonStr) {
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] no JSON object found (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+        const parsed = parseJsonWithRepair<T>(raw, label, "api-key", log);
+        if (parsed.error) {
+          lastError = parsed.error;
           log(lastError);
           return null;
         }
-
-        try {
-          return JSON.parse(jsonStr) as T;
-        } catch (err) {
-          const repairedJsonStr = repairCommonJson(jsonStr);
-          if (repairedJsonStr !== jsonStr) {
-            try {
-              const repaired = JSON.parse(repairedJsonStr) as T;
-              log(
-                `memory-lancedb-pro: llm-client [${label}] recovered malformed JSON via heuristic repair (jsonChars=${jsonStr.length})`,
-              );
-              return repaired;
-            } catch (repairErr) {
-              lastError =
-                `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
-              log(lastError);
-              return null;
-            }
-          }
-          lastError =
-            `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
-          log(lastError);
-          return null;
-        }
+        return parsed.value;
       } catch (err) {
         lastError =
           `memory-lancedb-pro: llm-client [${label}] request failed for model ${config.model}: ${err instanceof Error ? err.message : String(err)}`;
@@ -381,37 +399,13 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void):
             return null;
           }
 
-          const jsonStr = extractJsonFromResponse(raw);
-          if (!jsonStr) {
-            lastError =
-              `memory-lancedb-pro: llm-client [${label}] no JSON object found in OAuth response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+          const parsed = parseJsonWithRepair<T>(raw, label, "OAuth", log);
+          if (parsed.error) {
+            lastError = parsed.error;
             log(lastError);
             return null;
           }
-
-          try {
-            return JSON.parse(jsonStr) as T;
-          } catch (err) {
-            const repairedJsonStr = repairCommonJson(jsonStr);
-            if (repairedJsonStr !== jsonStr) {
-              try {
-                const repaired = JSON.parse(repairedJsonStr) as T;
-                log(
-                  `memory-lancedb-pro: llm-client [${label}] recovered malformed OAuth JSON via heuristic repair (jsonChars=${jsonStr.length})`,
-                );
-                return repaired;
-              } catch (repairErr) {
-                lastError =
-                  `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
-                log(lastError);
-                return null;
-              }
-            }
-            lastError =
-              `memory-lancedb-pro: llm-client [${label}] OAuth JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
-            log(lastError);
-            return null;
-          }
+          return parsed.value;
         } finally {
           dispose();
         }
@@ -440,6 +434,13 @@ const CLAUDE_CODE_STRIP_PREFIXES = ["CLAUDECODE_", "CLAUDE_CODE_"];
 const CLAUDE_CODE_STRIP_EXACT = new Set(["CLAUDECODE", "CLAUDE_CODE_SESSION", "CLAUDE_CODE_ENTRYPOINT", "MCP_SESSION_ID"]);
 /** Keys that start with CLAUDE_CODE_ but must be preserved for subprocess auth */
 const CLAUDE_CODE_PRESERVE = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_GIT_BASH_PATH"]);
+/** Returns true if the env key should be stripped for Claude Code subprocess isolation. */
+function shouldStripClaudeCodeEnvKey(key: string): boolean {
+  if (CLAUDE_CODE_PRESERVE.has(key)) return false;
+  if (CLAUDE_CODE_STRIP_EXACT.has(key)) return true;
+  return CLAUDE_CODE_STRIP_PREFIXES.some(p => key.startsWith(p));
+}
+
 /**
  * Build a sanitized environment for the Claude Code subprocess.
  *
@@ -464,11 +465,8 @@ export function buildClaudeCodeEnv(
 
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
-    // Strip ambient ANTHROPIC_API_KEY only when an explicit key is provided
     if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
-    if (CLAUDE_CODE_PRESERVE.has(k)) { env[k] = v; continue; }
-    if (CLAUDE_CODE_STRIP_EXACT.has(k)) continue;
-    if (CLAUDE_CODE_STRIP_PREFIXES.some(p => k.startsWith(p))) continue;
+    if (shouldStripClaudeCodeEnvKey(k)) continue;
     env[k] = v;
   }
 
@@ -514,6 +512,20 @@ const CLAUDE_CODE_DISALLOWED_TOOLS = [
   "WebFetch", "WebSearch", "Task", "NotebookEdit",
   "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
 ];
+
+/** Extract text from an SDK assistant message (content may be a block array or plain string). */
+function extractTextFromSdkMessage(message: unknown): string | null {
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((b: unknown) => typeof b === "object" && b !== null && (b as { type: string }).type === "text")
+      .map((b: unknown) => (b as { text?: string }).text ?? "")
+      .join("\n");
+    return text || null;
+  }
+  if (typeof content === "string") return content;
+  return null;
+}
 
 function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
@@ -598,10 +610,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const env = buildClaudeCodeEnv(config.apiKey, log);
       const model = config.model;
 
-      const effectiveTimeoutMs =
-        typeof config.timeoutMs === "number" && Number.isFinite(config.timeoutMs) && config.timeoutMs > 0
-          ? config.timeoutMs
-          : 30_000;
+      const effectiveTimeoutMs = resolveTimeoutMs(config.timeoutMs);
       const abortController = new AbortController();
       const timeoutTimer = setTimeout(() => abortController.abort(), effectiveTimeoutMs);
       const disposeTimeout = () => clearTimeout(timeoutTimer);
@@ -640,16 +649,8 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             break;
           }
           if (message.type === "assistant") {
-            const content = (message as { message?: { content?: unknown } }).message?.content;
-            if (Array.isArray(content)) {
-              const text = content
-                .filter((b: unknown) => typeof b === "object" && b !== null && (b as { type: string }).type === "text")
-                .map((b: unknown) => (b as { text?: string }).text ?? "")
-                .join("\n");
-              if (text) raw = text; // keep last assistant text as fallback
-            } else if (typeof content === "string") {
-              raw = content;
-            }
+            const text = extractTextFromSdkMessage(message);
+            if (text) raw = text; // keep last assistant text as fallback
           }
         }
 
@@ -659,32 +660,13 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           return null;
         }
 
-        const jsonStr = extractJsonFromResponse(raw);
-        if (!jsonStr) {
-          lastError = `memory-lancedb-pro: llm-client [${label}] no JSON found in claude-code response (chars=${raw.length}, preview=${JSON.stringify(previewText(raw))})`;
+        const parsed = parseJsonWithRepair<T>(raw, label, "claude-code", log);
+        if (parsed.error) {
+          lastError = parsed.error;
           log(lastError);
           return null;
         }
-
-        try {
-          return JSON.parse(jsonStr) as T;
-        } catch (err) {
-          const repairedJsonStr = repairCommonJson(jsonStr);
-          if (repairedJsonStr !== jsonStr) {
-            try {
-              const repaired = JSON.parse(repairedJsonStr) as T;
-              log(`memory-lancedb-pro: llm-client [${label}] recovered malformed claude-code JSON via repair (jsonChars=${jsonStr.length})`);
-              return repaired;
-            } catch (repairErr) {
-              lastError = `memory-lancedb-pro: llm-client [${label}] claude-code JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair: ${repairErr instanceof Error ? repairErr.message : String(repairErr)}`;
-              log(lastError);
-              return null;
-            }
-          }
-          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (preview=${JSON.stringify(previewText(jsonStr))})`;
-          log(lastError);
-          return null;
-        }
+        return parsed.value;
       } catch (err) {
         const isAbort = err instanceof Error && err.name === "AbortError";
         if (isAbort) {
