@@ -4,7 +4,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { mkdirSync, accessSync, constants as fsConstants } from "node:fs";
+import { mkdirSync, accessSync, constants as fsConstants, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import OpenAI from "openai";
@@ -467,6 +467,20 @@ export function buildClaudeCodeEnv(
   const hasExplicitKey = !!explicitApiKey;
   const env: Record<string, string> = {};
 
+  // Load Claude Code's settings.json env (OAuth tokens, ANTHROPIC_BASE_URL, etc.)
+  try {
+    const settingsPath = join(homedir(), ".claude", "settings.json");
+    const settingsRaw = readFileSync(settingsPath, "utf-8");
+    const settings = JSON.parse(settingsRaw) as { env?: Record<string, string> };
+    if (settings.env) {
+      for (const [k, v] of Object.entries(settings.env)) {
+        if (typeof v === "string") env[k] = v;
+      }
+    }
+  } catch {
+    // settings.json not found or parse error — continue with ambient env only
+  }
+
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
     if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
@@ -636,7 +650,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           prompt,
           options: {
             model,
-            cwd: sessionDir,
+            // cwd: sessionDir, // Temporarily disabled: isolated cwd may cause Claude Code auth issues
             pathToClaudeCodeExecutable: claudePath,
             disallowedTools: CLAUDE_CODE_DISALLOWED_TOOLS,
             env,
