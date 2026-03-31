@@ -133,6 +133,27 @@ describe("buildClaudeCodeEnv", () => {
       delete process.env.CLAUDE_CODE_GIT_BASH_PATH;
     }
   });
+
+  it("does not warn when ANTHROPIC_AUTH_TOKEN is present (subscription auth)", () => {
+    const savedKey = process.env.ANTHROPIC_API_KEY;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    const savedOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_AUTH_TOKEN = "claude-subscription-token";
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+    const warnLogs = [];
+    buildClaudeCodeEnv(undefined, undefined, (msg) => warnLogs.push(msg));
+    assert.ok(
+      !warnLogs.some(l => l.includes("no ANTHROPIC")),
+      "should not warn when ANTHROPIC_AUTH_TOKEN is present",
+    );
+
+    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
+    if (savedToken !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+    else delete process.env.ANTHROPIC_AUTH_TOKEN;
+    if (savedOauth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOauth;
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -264,3 +285,23 @@ describe("createLlmClient claude-code", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// createLlmClient — factory auth routing (early validation)
+// ---------------------------------------------------------------------------
+
+describe("createLlmClient factory auth validation", () => {
+  it("throws synchronously when auth='api-key' and no apiKey provided", () => {
+    assert.throws(
+      () => createLlmClient({ auth: "api-key", model: "gpt-4" }),
+      /api-key.*requires.*apiKey|requires.*apiKey/i,
+    );
+  });
+
+  it("throws synchronously when auth='oauth' and no oauthPath provided", () => {
+    assert.throws(
+      () => createLlmClient({ auth: "oauth", model: "gpt-4" }),
+      /oauth.*requires.*oauthPath|requires.*oauthPath/i,
+    );
+  });
+});

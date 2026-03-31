@@ -504,6 +504,12 @@ function resolveClaudeExecutable(configuredPath?: string): string {
     const cmd = process.platform === "win32" ? "where claude" : "which claude";
     const output = execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     const firstLine = output.split(/\r?\n/)[0].trim();
+    if (!firstLine) {
+      throw new Error(
+        "which/where claude returned an empty path. " +
+        "Install Claude Code (npm i -g @anthropic-ai/claude-code) or set llm.claudeCodePath in your config.",
+      );
+    }
     return firstLine;
   } catch (execErr) {
     const reason = execErr instanceof Error ? execErr.message : String(execErr);
