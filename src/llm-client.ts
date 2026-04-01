@@ -549,17 +549,18 @@ export function buildClaudeCodeEnv(
     }
   }
 
+  // Hoist outside loop — re-reading process.env on every iteration is redundant.
+  // CI/CD override: set CLAUDE_CODE_ENV_AUTH_PRIORITY=1 to make env vars win over settings.json.
+  const envAuthPriority = process.env["CLAUDE_CODE_ENV_AUTH_PRIORITY"] === "1";
+
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
     if (k === "ANTHROPIC_API_KEY" && hasExplicitKey) continue;
     if (shouldStripClaudeCodeEnvKey(k)) continue;
-    // settings.json takes precedence for auth keys to prevent stale env vars from overriding fresh tokens
     // settings.json auth keys take precedence over ambient env vars by default.
     // Rationale: in interactive use, settings.json typically holds the freshest OAuth
     // token written by the Claude Code desktop app. Env vars may be stale.
-    // CI/CD override: set CLAUDE_CODE_ENV_AUTH_PRIORITY=1 to make env vars win.
     const isAuthKey = k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN" || k === "CLAUDE_CODE_OAUTH_TOKEN";
-    const envAuthPriority = process.env["CLAUDE_CODE_ENV_AUTH_PRIORITY"] === "1";
     if (isAuthKey && env[k] && !envAuthPriority) continue; // settings.json wins (default)
     env[k] = v;
   }
@@ -799,9 +800,12 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
             if (typeof msg.result === "string") {
               raw = msg.result;
             } else {
-              // SDK returned non-string result - log as warning and set lastError for debugging
-              lastError = `memory-lancedb-pro: llm-client [${label}] result.result is not a string (type=${typeof msg.result}), will attempt assistant fallback`;
-              logWarn(lastError);
+              // SDK returned non-string result — record the specific error before attempting
+              // assistant-message fallback. Store in a separate variable so the more specific
+              // message is not overwritten by the generic empty-response error below.
+              const nonStringResultError = `memory-lancedb-pro: llm-client [${label}] result.result is not a string (type=${typeof msg.result}), will attempt assistant fallback`;
+              logWarn(nonStringResultError);
+              lastError = nonStringResultError;
               raw = null;
             }
             break;
@@ -827,8 +831,12 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         }
 
         if (!raw) {
-          lastError = `memory-lancedb-pro: llm-client [${label}] claude-code returned empty response for model ${model}`;
-          logWarn(lastError);
+          // Only overwrite lastError if we don't already have a more specific message
+          // (e.g. from the result.result is not a string path above).
+          if (!lastError) {
+            lastError = `memory-lancedb-pro: llm-client [${label}] claude-code returned empty response for model ${model}`;
+            logWarn(lastError);
+          }
           return null;
         }
 
