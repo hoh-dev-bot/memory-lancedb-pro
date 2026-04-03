@@ -676,10 +676,11 @@
             "type": "string",
             "enum": [
               "api-key",
-              "oauth"
+              "oauth",
+              "claude-code"
             ],
             "default": "api-key",
-            "description": "LLM authentication mode. oauth uses the local Codex/ChatGPT login cache instead of llm.apiKey."
+            "description": "LLM authentication mode: api-key (OpenAI-compatible), oauth (local Codex/ChatGPT cache), or claude-code (local Claude Code subprocess)."
           },
           "apiKey": {
             "type": "string"
@@ -703,6 +704,10 @@
             "type": "integer",
             "minimum": 1,
             "default": 30000
+          },
+          "claudeCodePath": {
+            "type": "string",
+            "description": "Path to the claude executable. Only used when llm.auth=claude-code. Auto-detected via which/where if not set."
           }
         }
       },
