@@ -70,8 +70,19 @@ import { batchDedup } from "./batch-dedup.js";
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 1. Strip "System: [timestamp] Channel..." lines
+  // 0. Strip runtime orchestration wrappers that should never become memories
+  //    (sub-agent task scaffolding is execution metadata, not conversation content).
   let cleaned = text.replace(
+    /^\[(?:Subagent Context|Subagent Task)\]\s*(?:You are running as a subagent.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)?/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
+    "",
+  );
+
+  // 1. Strip "System: [timestamp] Channel..." lines
+  cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
     "",
   );
@@ -401,6 +412,13 @@ export class SmartExtractor {
     let shortAbstractCount = 0;
     let noiseAbstractCount = 0;
     for (const raw of result.memories) {
+      if (!raw || typeof raw !== "object") {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping null/invalid candidate entry`,
+        );
+        continue;
+      }
       const category = normalizeCategory(raw.category ?? "");
       if (!category) {
         invalidCategoryCount++;
