@@ -270,11 +270,14 @@ function resolveTimeoutMs(timeoutMs?: number): number {
   return typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
 }
 
-function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose: () => void } {
+function createTimeoutSignal(timeoutMs?: number): { controller: AbortController; signal: AbortSignal; effectiveMs: number; dispose: () => void } {
+  const effectiveMs = resolveTimeoutMs(timeoutMs);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), resolveTimeoutMs(timeoutMs));
+  const timer = setTimeout(() => controller.abort(), effectiveMs);
   return {
+    controller,
     signal: controller.signal,
+    effectiveMs,
     dispose: () => clearTimeout(timer),
   };
 }
@@ -731,10 +734,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const env = buildClaudeCodeEnv(config.apiKey, log, logWarn);
       const model = config.model;
 
-      const effectiveTimeoutMs = resolveTimeoutMs(config.timeoutMs);
-      const abortController = new AbortController();
-      const timeoutTimer = setTimeout(() => abortController.abort(), effectiveTimeoutMs);
-      const disposeTimeout = () => clearTimeout(timeoutTimer);
+      const { controller: abortController, effectiveMs: effectiveTimeoutMs, dispose: disposeTimeout } = createTimeoutSignal(config.timeoutMs);
       try {
         const result = queryFn({
           prompt,
