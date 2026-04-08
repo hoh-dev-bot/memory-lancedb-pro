@@ -76,24 +76,11 @@ interface TokenRefreshResponse {
 }
 
 function parseNumericTimestamp(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return value > 1_000_000_000_000 ? value : value * 1000;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return undefined;
-    const parsed = Number(trimmed);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      return parsed > 1_000_000_000_000 ? parsed : parsed * 1000;
-    }
-  }
-
-  return undefined;
-}
-
-function toBase64Url(value: Buffer): string {
-  return value.toString("base64url");
+  const num = typeof value === "number" ? value
+    : typeof value === "string" && value.trim() ? Number(value.trim())
+    : NaN;
+  if (!Number.isFinite(num) || num <= 0) return undefined;
+  return num > 1_000_000_000_000 ? num : num * 1000;
 }
 
 function createState(): string {
@@ -101,7 +88,7 @@ function createState(): string {
 }
 
 function createPkceVerifier(): string {
-  return toBase64Url(randomBytes(32));
+  return randomBytes(32).toString("base64url");
 }
 
 function createPkceChallenge(verifier: string): string {
@@ -185,23 +172,11 @@ function buildAuthorizationUrl(state: string, verifier: string, providerId?: str
 }
 
 function buildSuccessHtml(): string {
-  return [
-    "<!doctype html>",
-    "<html><body>",
-    "<h1>memory-pro OAuth complete</h1>",
-    "<p>You can close this window and return to your terminal.</p>",
-    "</body></html>",
-  ].join("");
+  return "<!doctype html><html><body><h1>memory-pro OAuth complete</h1><p>You can close this window and return to your terminal.</p></body></html>";
 }
 
 function buildErrorHtml(message: string): string {
-  return [
-    "<!doctype html>",
-    "<html><body>",
-    "<h1>memory-pro OAuth failed</h1>",
-    `<p>${message}</p>`,
-    "</body></html>",
-  ].join("");
+  return `<!doctype html><html><body><h1>memory-pro OAuth failed</h1><p>${message}</p></body></html>`;
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
@@ -248,14 +223,13 @@ function pickTimestamp(container: Record<string, unknown>, keys: string[]): numb
 }
 
 function extractSessionFromObject(source: Record<string, unknown>, authPath: string): OAuthSession | null {
+  const nestedKeys = ["tokens", "oauth", "openai", "chatgpt", "auth", "credentials"] as const;
   const scopes: Record<string, unknown>[] = [
     source,
-    typeof source.tokens === "object" && source.tokens ? source.tokens as Record<string, unknown> : {},
-    typeof source.oauth === "object" && source.oauth ? source.oauth as Record<string, unknown> : {},
-    typeof source.openai === "object" && source.openai ? source.openai as Record<string, unknown> : {},
-    typeof source.chatgpt === "object" && source.chatgpt ? source.chatgpt as Record<string, unknown> : {},
-    typeof source.auth === "object" && source.auth ? source.auth as Record<string, unknown> : {},
-    typeof source.credentials === "object" && source.credentials ? source.credentials as Record<string, unknown> : {},
+    ...nestedKeys.map((key) => {
+      const val = source[key];
+      return typeof val === "object" && val ? val as Record<string, unknown> : {};
+    }),
   ];
 
   let accessToken: string | undefined;
@@ -337,14 +311,10 @@ export function needsRefresh(session: OAuthSession): boolean {
 }
 
 function createTimeoutSignal(timeoutMs?: number): { signal: AbortSignal; dispose: () => void } {
-  const effectiveTimeoutMs =
-    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
+  const ms = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 30_000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
-  return {
-    signal: controller.signal,
-    dispose: () => clearTimeout(timer),
-  };
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, dispose: () => clearTimeout(timer) };
 }
 
 export async function refreshOAuthSession(session: OAuthSession, timeoutMs?: number): Promise<OAuthSession> {
@@ -466,20 +436,12 @@ export async function saveOAuthSession(authPath: string, session: OAuthSession):
 }
 
 function tryOpenBrowser(url: string): void {
-  const targetPlatform = platform();
-  if (targetPlatform === "darwin") {
-    const child = spawn("open", [url], { detached: true, stdio: "ignore" });
-    child.unref();
-    return;
-  }
-
-  if (targetPlatform === "win32") {
-    const child = spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" });
-    child.unref();
-    return;
-  }
-
-  const child = spawn("xdg-open", [url], { detached: true, stdio: "ignore" });
+  const p = platform();
+  const [cmd, args] =
+    p === "darwin" ? ["open", [url]] :
+    p === "win32" ? ["cmd", ["/c", "start", "", url]] :
+    ["xdg-open", [url]];
+  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
   child.unref();
 }
 
@@ -490,8 +452,10 @@ async function waitForAuthorizationCode(state: string, timeoutMs: number, provid
   const listenHost = resolveOAuthCallbackListenHost(redirectUri);
 
   return await new Promise<string>((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); server.close(); };
+
     const timer = setTimeout(() => {
-      server.close();
+      cleanup();
       reject(new Error(`Timed out waiting for OAuth callback on ${redirectUri.origin}${callbackPath}`));
     }, timeoutMs);
 
@@ -514,8 +478,7 @@ async function waitForAuthorizationCode(state: string, timeoutMs: number, provid
       const error = url.searchParams.get("error");
 
       if (error) {
-        clearTimeout(timer);
-        server.close();
+        cleanup();
         res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
         res.end(buildErrorHtml(`Authorization failed: ${error}`));
         reject(new Error(`OAuth authorization failed: ${error}`));
@@ -523,16 +486,14 @@ async function waitForAuthorizationCode(state: string, timeoutMs: number, provid
       }
 
       if (!code || returnedState !== state) {
-        clearTimeout(timer);
-        server.close();
+        cleanup();
         res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
         res.end(buildErrorHtml("Invalid authorization callback."));
         reject(new Error("OAuth callback did not include a valid code/state pair"));
         return;
       }
 
-      clearTimeout(timer);
-      server.close();
+      cleanup();
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(buildSuccessHtml());
       resolve(code);

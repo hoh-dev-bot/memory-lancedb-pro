@@ -63,32 +63,13 @@ function extractJsonFromResponse(text: string): string | null {
   // Find the first JSON structure (object or array)
   const firstBrace = text.indexOf("{");
   const firstBracket = text.indexOf("[");
-  
-  let startIdx: number;
-  let openChar: string;
-  let closeChar: string;
-  
+
   if (firstBrace === -1 && firstBracket === -1) return null;
-  if (firstBrace === -1) {
-    startIdx = firstBracket;
-    openChar = "[";
-    closeChar = "]";
-  } else if (firstBracket === -1) {
-    startIdx = firstBrace;
-    openChar = "{";
-    closeChar = "}";
-  } else {
-    // Use whichever comes first
-    if (firstBrace < firstBracket) {
-      startIdx = firstBrace;
-      openChar = "{";
-      closeChar = "}";
-    } else {
-      startIdx = firstBracket;
-      openChar = "[";
-      closeChar = "]";
-    }
-  }
+
+  const useObject = firstBracket === -1 || (firstBrace !== -1 && firstBrace < firstBracket);
+  const startIdx = useObject ? firstBrace : firstBracket;
+  const openChar = useObject ? "{" : "[";
+  const closeChar = useObject ? "}" : "]";
 
   // Track depth, ignoring brackets inside strings
   let depth = 0;
@@ -264,6 +245,22 @@ function parseJsonWithRepair<T>(
   }
 }
 
+function extractOutputTextFromJsonBody(bodyText: string): string | null {
+  const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+  const output = Array.isArray(parsed.output) ? parsed.output : [];
+  const first = output.find(
+    (item) =>
+      item &&
+      typeof item === "object" &&
+      Array.isArray((item as Record<string, unknown>).content),
+  ) as Record<string, unknown> | undefined;
+  if (!first) return null;
+  const content = (first.content as Array<Record<string, unknown>>).find(
+    (part) => part?.type === "output_text" && typeof part.text === "string",
+  );
+  return typeof content?.text === "string" ? content.text : null;
+}
+
 function looksLikeSseResponse(bodyText: string): boolean {
   const trimmed = bodyText.trimStart();
   return trimmed.startsWith("event:") || trimmed.startsWith("data:");
@@ -417,33 +414,11 @@ function createOauthClient(config: LlmClientConfig, log: (msg: string) => void, 
           if (!response.ok) {
             throw new Error(`HTTP ${response.status} ${response.statusText}: ${bodyText.slice(0, 500)}`);
           }
-          const raw = (
-            response.headers.get("content-type")?.includes("text/event-stream") ||
-            looksLikeSseResponse(bodyText)
-          )
+          const isSse = response.headers.get("content-type")?.includes("text/event-stream") ||
+            looksLikeSseResponse(bodyText);
+          const raw = isSse
             ? extractOutputTextFromSse(bodyText)
-            : (() => {
-                try {
-                  const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-                  const output = Array.isArray(parsed.output) ? parsed.output : [];
-                  const first = output.find(
-                    (item) =>
-                      item &&
-                      typeof item === "object" &&
-                      Array.isArray((item as Record<string, unknown>).content),
-                  ) as Record<string, unknown> | undefined;
-                  if (!first) return null;
-                  const content = (first.content as Array<Record<string, unknown>>).find(
-                    (part) => part?.type === "output_text" && typeof part.text === "string",
-                  );
-                  return typeof content?.text === "string" ? content.text : null;
-                } catch (parseErr) {
-                  // Propagate instead of silently returning null — caller deserves diagnostics
-                  throw new Error(
-                    `failed to parse OAuth response body: ${parseErr instanceof Error ? parseErr.message : String(parseErr)} (preview=${JSON.stringify(previewText(bodyText))})`
-                  );
-                }
-              })();
+            : extractOutputTextFromJsonBody(bodyText);
 
           if (!raw) {
             lastError =
@@ -739,15 +714,11 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       const claudePath = cachedClaudePath;
 
       // Isolated cwd to keep memory-agent sessions out of user's claude history
-      let baseDir: string;
-      if (config.stateDir && config.stateDir.length > 1) {
-        baseDir = config.stateDir;
-      } else {
-        if (config.stateDir !== undefined && config.stateDir.length <= 1) {
-          logWarn(`memory-lancedb-pro: llm-client [claude-code] ignoring unsafe stateDir="${config.stateDir}" (path too short); using default path`);
-        }
-        baseDir = join(homedir(), ".openclaw", "memory-lancedb-pro");
+      const defaultBaseDir = join(homedir(), ".openclaw", "memory-lancedb-pro");
+      if (config.stateDir !== undefined && config.stateDir.length <= 1) {
+        logWarn(`memory-lancedb-pro: llm-client [claude-code] ignoring unsafe stateDir="${config.stateDir}" (path too short); using default path`);
       }
+      const baseDir = config.stateDir && config.stateDir.length > 1 ? config.stateDir : defaultBaseDir;
       const sessionDir = join(baseDir, "claude-code-sessions");
       try {
         mkdirSync(sessionDir, { recursive: true }); // no-op if already exists
