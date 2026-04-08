@@ -525,10 +525,12 @@ const CLAUDE_CODE_DISALLOWED_TOOLS = [
   "AskUserQuestion", "TodoWrite", "TodoRead", "LS",
 ];
 
+type ClaudeCodeQueryFn = (args: { prompt: string; options: Record<string, unknown> }) => AsyncIterable<Record<string, unknown>>;
+
 function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => void): LlmClient {
   let lastError: string | null = null;
   let cachedSdkError: string | null = null; // Cache SDK import failure
-  let cachedQueryFn: any = null;
+  let cachedQueryFn: ClaudeCodeQueryFn | null = null;
   let claudePath: string | null = null;
   let cachedClaudePathError: string | null = null;
 
@@ -540,7 +542,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
       if (!cachedQueryFn && !cachedSdkError) {
         try {
           const sdk = await import("@anthropic-ai/claude-agent-sdk");
-          cachedQueryFn = sdk.query;
+          cachedQueryFn = sdk.query as ClaudeCodeQueryFn;
         } catch (importErr: any) {
           const isModuleNotFound =
             ("code" in importErr && importErr.code === "MODULE_NOT_FOUND") ||
@@ -649,25 +651,7 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
           return null;
         }
 
-        // JSON extraction + parse (duplicated from extractJsonFromResponse to avoid refactor dependency)
-        const fenceMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-        const jsonStr = fenceMatch ? fenceMatch[1].trim() : (() => {
-          const firstBrace = raw.indexOf("{");
-          if (firstBrace === -1) return null;
-          let depth = 0;
-          let lastBrace = -1;
-          for (let i = firstBrace; i < raw.length; i++) {
-            if (raw[i] === "{") depth++;
-            else if (raw[i] === "}") {
-              depth--;
-              if (depth === 0) {
-                lastBrace = i;
-                break;
-              }
-            }
-          }
-          return lastBrace === -1 ? null : raw.substring(firstBrace, lastBrace + 1);
-        })();
+        const jsonStr = extractJsonFromResponse(raw);
 
         if (!jsonStr) {
           lastError = `memory-lancedb-pro: llm-client [${label}] no JSON found in claude-code response`;
@@ -678,7 +662,22 @@ function createClaudeCodeClient(config: LlmClientConfig, log: (msg: string) => v
         try {
           return JSON.parse(jsonStr) as T;
         } catch (err) {
-          lastError = `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)}`;
+          const repairedJsonStr = repairCommonJson(jsonStr);
+          if (repairedJsonStr !== jsonStr) {
+            try {
+              const repaired = JSON.parse(repairedJsonStr) as T;
+              log(
+                `memory-lancedb-pro: llm-client [${label}] recovered malformed claude-code JSON via heuristic repair (jsonChars=${jsonStr.length})`,
+              );
+              return repaired;
+            } catch (repairErr) {
+              lastError =
+                `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)}; repair failed: ${repairErr instanceof Error ? repairErr.message : String(repairErr)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
+              log(lastError);
+              return null;
+            }
+          }
+          lastError = `memory-lancedb-pro: llm-client [${label}] JSON.parse failed: ${err instanceof Error ? err.message : String(err)} (jsonChars=${jsonStr.length}, jsonPreview=${JSON.stringify(previewText(jsonStr))})`;
           log(lastError);
           return null;
         }

@@ -230,26 +230,11 @@ describe("createLlmClient claude-code", { skip: skipClaudeCodeTests }, () => {
     }
   });
 
-  it("returns null and sets lastError when SDK import fails (optional dep not installed)", async () => {
-    // This test is naturally covered by the skip guard, but we document the behavior:
-    // When SDK is missing, createLlmClient will fail at import time and set cachedClaudeCodeSdkModule = null,
-    // causing all completeJson calls to return null with a descriptive error.
-    // If we wanted to force-test this path, we'd need to mock the import, which is impractical in unit tests.
-    // Instead, we rely on CI/testing without the SDK installed to validate this path.
-    assert.ok(true, "SDK import failure path is covered by skip guard + CI without optional deps");
-  });
+  // SDK import failure: validated by running the suite without @anthropic-ai/claude-agent-sdk installed.
+  // The skip guard at the top skips all tests in that config, but the import() in createClaudeCodeClient
+  // sets cachedSdkError and returns null on the first completeJson call.
+  // CI validates this path in the "no optional deps" matrix job.
 
-  it("handles timeout gracefully when timeoutMs is set (integration-only)", async () => {
-    // Timeout handling is tested in integration tests with real SDK calls.
-    // Unit tests cannot easily mock SDK subprocess timeout without heavy mocking infrastructure.
-    // We document the expected behavior: when SDK times out, completeJson should return null and set lastError.
-    assert.ok(true, "Timeout handling validated via integration tests");
-  });
-
-  it("wraps SDK spawn errors with user-friendly messages (integration-only)", async () => {
-    // When SDK spawns claude but the process fails (e.g., binary corrupted, permission denied),
-    // the error is caught and wrapped in completeJson's try-catch, setting lastError.
-    // This is tested in integration tests with actual SDK + broken claude binaries.
-    assert.ok(true, "Spawn error wrapping validated via integration tests");
-  });
+  // Timeout and spawn-error paths require integration tests with a real SDK subprocess.
+  // Out of scope for unit tests; validated in the integration test suite.
 });
